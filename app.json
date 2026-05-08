@@ -1,0 +1,62 @@
+{
+  "expo": {
+    "name": "NOOM",
+    "slug": "noom",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#050A14"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.noom.app",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "NOOM needs Bluetooth to connect to your Empatica E4 wristband for sleep monitoring.",
+        "NSBluetoothPeripheralUsageDescription": "NOOM needs Bluetooth to connect to your Empatica E4 wristband.",
+        "UIBackgroundModes": [
+          "bluetooth-central",
+          "fetch",
+          "remote-notification"
+        ]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#050A14"
+      },
+      "package": "com.noom.app",
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.RECEIVE_BOOT_COMPLETED"
+      ]
+    },
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+          "modes": [
+            "peripheral",
+            "central"
+          ],
+          "bluetoothAlwaysPermission": "Allow NOOM to connect to your wristband for sleep monitoring."
+        }
+      ],
+      "expo-notifications"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "14db6d08-3aa8-4354-9c1c-5f9bff8f3296"
+      }
+    }
+  }
+}

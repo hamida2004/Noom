@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
   ScrollView, Animated,
+  Pressable,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
@@ -19,11 +20,40 @@ import {
   saveSession, generateSessionId, todayDateStr,
 } from '../services/storage';
 
+
 const STAGE_COLORS = [colors.wake, colors.ndeep, colors.deep];
 const STAGE_NAMES  = ['WAKE', 'LIGHT', 'DEEP'];
 
 export default function MonitoringScreen({ navigation }) {
   const insets = useSafeAreaInsets();
+
+  async function testOnnx() {
+  try {
+
+    console.log('Loading model...');
+
+    await loadModel();
+
+    console.log('Model loaded.');
+
+    const dummyWindow = Array.from({ length: 1920 }, () => ({
+      bvp: 300,
+      acc_x: 0.01,
+      acc_y: 0.01,
+      acc_z: 0.01,
+      temp: 36.5,
+      hr: 65,
+      ibi: 900,
+    }));
+
+    const probs = await predict(dummyWindow);
+
+    console.log('Inference OK:', probs);
+
+  } catch (e) {
+    console.error('ONNX TEST FAILED:', e);
+  }
+}
 
   const [active, setActive]       = useState(false);
   const [bleOk, setBleOk]         = useState(false);
@@ -36,6 +66,7 @@ export default function MonitoringScreen({ navigation }) {
   const [timeline, setTimeline]   = useState([]);      // { stage, ts }
 
   const sessionRef   = useRef(null);
+  const simRef = useRef(null);
   const predsRef     = useRef([]);
   const prefsRef     = useRef(null);
   const pulseAnim    = useRef(new Animated.Value(1)).current;
@@ -248,7 +279,13 @@ export default function MonitoringScreen({ navigation }) {
           <ActionBadge action={action} />
         </View>
       )}
-
+  <View>
+    <Pressable
+    onPress={testOnnx}
+    >
+      <Text>test</Text>
+    </Pressable>
+  </View>
       {/* ── Probability bars ──────────────────────────────────── */}
       {active && (
         <View style={styles.card}>

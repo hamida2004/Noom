@@ -10,6 +10,10 @@
       "resizeMode": "contain",
       "backgroundColor": "#050A14"
     },
+    "assetBundlePatterns": [
+    "**/*",
+    "assets/model/*"
+    ],
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.noom.app",
@@ -51,7 +55,8 @@
           "bluetoothAlwaysPermission": "Allow NOOM to connect to your wristband for sleep monitoring."
         }
       ],
-      "expo-notifications"
+      "expo-notifications",
+      "expo-asset"
     ],
     "extra": {
       "eas": {

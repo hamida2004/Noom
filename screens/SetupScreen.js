@@ -8,84 +8,40 @@ import { colors, spacing, radius, typography } from '../theme';
 import {
   checkBleState, scanForDevices, stopScan,
   connectToDevice, disconnectDevice, isConnected, getConnectedDevice,
+  requestBlePermissions,   // ← defined in ble.js, NOT here
 } from '../services/ble';
 import { loadAlarmTime, saveAlarmTime, loadCalibration } from '../services/storage';
 import { State } from 'react-native-ble-plx';
-import { PermissionsAndroid} from 'react-native';
-
-export async function requestBlePermissions() {
-  useEffect(() => {
-  async function init() {
-    const ok = await requestBlePermissions();
-
-    if (!ok) {
-      Alert.alert(
-        'Permissions required',
-        'Bluetooth permissions are required.'
-      );
-      return;
-    }
-
-    checkBleReady();
-  }
-
-  init();
-}, []);
-
-
-  if (Platform.OS !== 'android') return true;
-
-  try {
-    if (Platform.Version >= 31) {
-      const granted = await PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      ]);
-
-      return (
-        granted['android.permission.BLUETOOTH_SCAN'] === PermissionsAndroid.RESULTS.GRANTED &&
-        granted['android.permission.BLUETOOTH_CONNECT'] === PermissionsAndroid.RESULTS.GRANTED &&
-        granted['android.permission.ACCESS_FINE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED
-      );
-    }
-
-    const granted = await PermissionsAndroid.request(
-      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-    );
-
-    return granted === PermissionsAndroid.RESULTS.GRANTED;
-
-  } catch (err) {
-    console.warn(err);
-    return false;
-  }
-}
-
-
 
 export default function SetupScreen({ navigation }) {
   const insets = useSafeAreaInsets();
 
-  // BLE
-  const [bleReady, setBleReady]         = useState(false);
-  const [scanning, setScanning]         = useState(false);
-  const [devices, setDevices]           = useState([]);
-  const [connecting, setConnecting]     = useState(null);
-  const [connected, setConnected]       = useState(false);
+  const [bleReady, setBleReady]           = useState(false);
+  const [scanning, setScanning]           = useState(false);
+  const [devices, setDevices]             = useState([]);
+  const [connecting, setConnecting]       = useState(null);
+  const [connected, setConnected]         = useState(false);
   const [connectedName, setConnectedName] = useState('');
-
-  // Alarm
-  const [alarmHour, setAlarmHour]       = useState(7);
-  const [alarmMinute, setAlarmMinute]   = useState(0);
-
-  // Calibration
-  const [calibrated, setCalibrated]     = useState(false);
+  const [alarmHour, setAlarmHour]         = useState(7);
+  const [alarmMinute, setAlarmMinute]     = useState(0);
+  const [calibrated, setCalibrated]       = useState(false);
 
   const devicesRef = useRef({});
 
   useEffect(() => {
-    checkBleReady();
+    async function init() {
+      const ok = await requestBlePermissions();
+      if (!ok) {
+        Alert.alert(
+          'Permissions required',
+          'Bluetooth permissions are required. Go to Settings → Apps → NOOM → Permissions.',
+        );
+        return;
+      }
+      checkBleReady();
+    }
+    init();
+
     loadAlarmTime().then(t => {
       const [h, m] = t.split(':').map(Number);
       setAlarmHour(h);
@@ -106,11 +62,11 @@ export default function SetupScreen({ navigation }) {
     const state = await checkBleState();
     setBleReady(state === State.PoweredOn);
     if (state !== State.PoweredOn && Platform.OS === 'android') {
-      Alert.alert('Bluetooth', 'Please enable Bluetooth to connect your wristband.');
+      Alert.alert('Bluetooth off', 'Please enable Bluetooth to connect your wristband.');
     }
   }
 
-  function startScan() {
+  async function startScan() {
     if (!bleReady) { Alert.alert('Bluetooth off', 'Please enable Bluetooth first.'); return; }
     devicesRef.current = {};
     setDevices([]);
@@ -123,17 +79,10 @@ export default function SetupScreen({ navigation }) {
           setDevices(Object.values(devicesRef.current));
         }
       },
-      (err) => {
-        setScanning(false);
-        Alert.alert('Scan error', err.message);
-      }
+      (err) => { setScanning(false); Alert.alert('Scan error', err.message); }
     );
 
-    // Auto-stop after 15s
-    setTimeout(() => {
-      stopScan();
-      setScanning(false);
-    }, 15000);
+    setTimeout(() => { stopScan(); setScanning(false); }, 15000);
   }
 
   async function connect(device) {
@@ -142,17 +91,13 @@ export default function SetupScreen({ navigation }) {
     setConnecting(device.id);
     try {
       await connectToDevice(
-        device,
-        null, // data handler set during monitoring
+        device, null,
         (status, dev) => {
           setConnected(true);
           setConnectedName(dev?.name ?? device.name ?? device.id);
           setConnecting(null);
         },
-        () => {
-          setConnected(false);
-          setConnectedName('');
-        }
+        () => { setConnected(false); setConnectedName(''); }
       );
     } catch (e) {
       setConnecting(null);
@@ -178,10 +123,11 @@ export default function SetupScreen({ navigation }) {
 
       <FlatList
         data={[]}
+        renderItem={null}
+        keyExtractor={() => ''}
         ListHeaderComponent={() => (
           <View style={styles.content}>
 
-            {/* ── BLE Connection ───────────────────────────── */}
             <SectionHeader title="WRISTBAND" />
             <View style={styles.card}>
               {connected ? (
@@ -199,9 +145,7 @@ export default function SetupScreen({ navigation }) {
                 <>
                   <View style={styles.bleStatusRow}>
                     <View style={[styles.bleDot, { backgroundColor: bleReady ? colors.success : colors.danger }]} />
-                    <Text style={styles.bleStatus}>
-                      Bluetooth {bleReady ? 'ready' : 'off'}
-                    </Text>
+                    <Text style={styles.bleStatus}>Bluetooth {bleReady ? 'ready' : 'off'}</Text>
                   </View>
                   <TouchableOpacity
                     style={[styles.primaryBtn, !bleReady && styles.btnDisabled]}
@@ -234,11 +178,13 @@ export default function SetupScreen({ navigation }) {
               )}
             </View>
 
-            {/* ── Calibration ──────────────────────────────── */}
             <SectionHeader title="CALIBRATION" />
             <View style={styles.card}>
               <View style={styles.calibRow}>
-                <View style={[styles.calibStatus, { backgroundColor: calibrated ? colors.success + '20' : colors.warning + '20', borderColor: calibrated ? colors.success : colors.warning }]}>
+                <View style={[styles.calibStatus, {
+                  backgroundColor: calibrated ? colors.success + '20' : colors.warning + '20',
+                  borderColor: calibrated ? colors.success : colors.warning,
+                }]}>
                   <Text style={{ color: calibrated ? colors.success : colors.warning, fontWeight: '700' }}>
                     {calibrated ? '✓ Calibrated' : '⚠ Not calibrated'}
                   </Text>
@@ -252,25 +198,20 @@ export default function SetupScreen({ navigation }) {
                 onPress={() => navigation.navigate('Calibration')}
                 disabled={!connected}
               >
-                <Text style={styles.primaryBtnText}>
-                  {calibrated ? 'Re-calibrate' : 'Run Calibration'}
-                </Text>
+                <Text style={styles.primaryBtnText}>{calibrated ? 'Re-calibrate' : 'Run Calibration'}</Text>
               </TouchableOpacity>
-              {!connected && (
-                <Text style={styles.requiresConnection}>Requires wristband connection</Text>
-              )}
+              {!connected && <Text style={styles.requiresConnection}>Requires wristband connection</Text>}
             </View>
 
-            {/* ── Alarm Time ────────────────────────────────── */}
             <SectionHeader title="ALARM TIME" />
             <View style={styles.card}>
               <View style={styles.timePicker}>
-                <NumberPicker value={alarmHour} min={0} max={23} onChange={setAlarmHour} label="HH" />
+                <NumberPicker value={alarmHour}   min={0} max={23}    onChange={setAlarmHour}   label="HH" />
                 <Text style={styles.colon}>:</Text>
                 <NumberPicker value={alarmMinute} min={0} max={59} step={5} onChange={setAlarmMinute} label="MM" />
               </View>
               <Text style={styles.alarmPreview}>
-                Wake window: {`${String((alarmHour - 0 + 23) % 24).padStart(2,'0')}:${String(alarmMinute).padStart(2,'0')}`} – {`${String(alarmHour).padStart(2,'0')}:${String(alarmMinute).padStart(2,'0')}`}
+                Wake window: {`${String((alarmHour + 23) % 24).padStart(2,'0')}:${String(alarmMinute).padStart(2,'0')}`} – {`${String(alarmHour).padStart(2,'0')}:${String(alarmMinute).padStart(2,'0')}`}
               </Text>
               <TouchableOpacity style={styles.primaryBtn} onPress={saveAlarm}>
                 <Text style={styles.primaryBtnText}>Save Alarm Time</Text>
@@ -279,83 +220,64 @@ export default function SetupScreen({ navigation }) {
 
           </View>
         )}
-        renderItem={null}
-        keyExtractor={() => ''}
       />
     </View>
   );
 }
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
 
 function SectionHeader({ title }) {
   return <Text style={styles.sectionHeader}>{title}</Text>;
 }
 
 function NumberPicker({ value, min, max, step = 1, onChange, label }) {
-  const inc = () => onChange(Math.min(max, value + step));
-  const dec = () => onChange(Math.max(min, value - step));
-
   return (
     <View style={styles.picker}>
       <Text style={styles.pickerLabel}>{label}</Text>
-      <TouchableOpacity style={styles.pickerBtn} onPress={inc}>
+      <TouchableOpacity style={styles.pickerBtn} onPress={() => onChange(Math.min(max, value + step))}>
         <Text style={styles.pickerArrow}>▲</Text>
       </TouchableOpacity>
       <Text style={styles.pickerValue}>{String(value).padStart(2, '0')}</Text>
-      <TouchableOpacity style={styles.pickerBtn} onPress={dec}>
+      <TouchableOpacity style={styles.pickerBtn} onPress={() => onChange(Math.max(min, value - step))}>
         <Text style={styles.pickerArrow}>▼</Text>
       </TouchableOpacity>
     </View>
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
-  container:   { flex: 1, backgroundColor: colors.bg },
-  content:     { padding: spacing.lg, paddingBottom: spacing.xxl },
-  screenTitle: { ...typography.h1, padding: spacing.lg, paddingBottom: 0 },
-
-  sectionHeader: { ...typography.label, marginTop: spacing.lg, marginBottom: spacing.sm },
-  card:          { backgroundColor: colors.card, borderRadius: radius.lg, padding: spacing.md, borderWidth: 1, borderColor: colors.border, marginBottom: spacing.sm },
-
-  // BLE
-  bleStatusRow:   { flexDirection: 'row', alignItems: 'center', marginBottom: spacing.md },
-  bleDot:         { width: 8, height: 8, borderRadius: 4, marginRight: spacing.sm },
-  bleStatus:      { ...typography.body },
-  deviceList:     { marginTop: spacing.md },
-  deviceListLabel:{ ...typography.label, marginBottom: spacing.sm },
-  deviceItem:     { backgroundColor: colors.surface, borderRadius: radius.md, padding: spacing.md, marginBottom: spacing.sm, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderColor: colors.border },
+  container:    { flex: 1, backgroundColor: colors.bg },
+  content:      { padding: spacing.lg, paddingBottom: spacing.xxl },
+  screenTitle:  { ...typography.h1, padding: spacing.lg, paddingBottom: 0 },
+  sectionHeader:{ ...typography.label, marginTop: spacing.lg, marginBottom: spacing.sm },
+  card:         { backgroundColor: colors.card, borderRadius: radius.lg, padding: spacing.md, borderWidth: 1, borderColor: colors.border, marginBottom: spacing.sm },
+  bleStatusRow: { flexDirection: 'row', alignItems: 'center', marginBottom: spacing.md },
+  bleDot:       { width: 8, height: 8, borderRadius: 4, marginRight: spacing.sm },
+  bleStatus:    { ...typography.body },
+  deviceList:   { marginTop: spacing.md },
+  deviceListLabel: { ...typography.label, marginBottom: spacing.sm },
+  deviceItem:   { backgroundColor: colors.surface, borderRadius: radius.md, padding: spacing.md, marginBottom: spacing.sm, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderColor: colors.border },
   deviceItemConnecting: { borderColor: colors.primary },
-  deviceName:     { ...typography.h3 },
-  deviceId:       { ...typography.caption },
-
-  connectedRow:   { flexDirection: 'row', alignItems: 'center' },
-  connectedDot:   { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.success, marginRight: spacing.sm },
+  deviceName:   { ...typography.h3 },
+  deviceId:     { ...typography.caption },
+  connectedRow: { flexDirection: 'row', alignItems: 'center' },
+  connectedDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.success, marginRight: spacing.sm },
   connectedLabel: { ...typography.caption, color: colors.success },
   connectedName:  { ...typography.h3 },
   disconnectBtn:  { paddingHorizontal: spacing.md, paddingVertical: spacing.sm, borderRadius: radius.full, borderWidth: 1, borderColor: colors.danger + '60' },
   disconnectText: { ...typography.caption, color: colors.danger },
-
   requiresConnection: { ...typography.caption, color: colors.textSub, marginTop: spacing.sm, textAlign: 'center' },
-
-  // Calibration
-  calibRow:   { marginBottom: spacing.sm },
-  calibStatus:{ alignSelf: 'flex-start', paddingHorizontal: spacing.md, paddingVertical: spacing.xs, borderRadius: radius.full, borderWidth: 1 },
-  calibNote:  { ...typography.body, color: colors.textSub, marginVertical: spacing.sm, fontSize: 13 },
-
-  // Alarm time picker
-  timePicker:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: spacing.md },
-  colon:       { fontSize: 40, fontWeight: '700', color: colors.primary, marginHorizontal: spacing.md },
-  picker:      { alignItems: 'center' },
-  pickerLabel: { ...typography.label, marginBottom: spacing.xs },
-  pickerBtn:   { padding: spacing.sm },
-  pickerArrow: { color: colors.primary, fontSize: 16, fontWeight: '700' },
-  pickerValue: { fontSize: 48, fontWeight: '800', color: colors.text, letterSpacing: -1 },
-  alarmPreview:{ ...typography.caption, textAlign: 'center', marginBottom: spacing.md },
-
-  // Buttons
-  primaryBtn:     { backgroundColor: colors.primary, borderRadius: radius.full, paddingVertical: spacing.md, alignItems: 'center', flexDirection: 'row', justifyContent: 'center' },
+  calibRow:     { marginBottom: spacing.sm },
+  calibStatus:  { alignSelf: 'flex-start', paddingHorizontal: spacing.md, paddingVertical: spacing.xs, borderRadius: radius.full, borderWidth: 1 },
+  calibNote:    { ...typography.body, color: colors.textSub, marginVertical: spacing.sm, fontSize: 13 },
+  timePicker:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: spacing.md },
+  colon:        { fontSize: 40, fontWeight: '700', color: colors.primary, marginHorizontal: spacing.md },
+  picker:       { alignItems: 'center' },
+  pickerLabel:  { ...typography.label, marginBottom: spacing.xs },
+  pickerBtn:    { padding: spacing.sm },
+  pickerArrow:  { color: colors.primary, fontSize: 16, fontWeight: '700' },
+  pickerValue:  { fontSize: 48, fontWeight: '800', color: colors.text, letterSpacing: -1 },
+  alarmPreview: { ...typography.caption, textAlign: 'center', marginBottom: spacing.md },
+  primaryBtn:   { backgroundColor: colors.primary, borderRadius: radius.full, paddingVertical: spacing.md, alignItems: 'center', flexDirection: 'row', justifyContent: 'center' },
   primaryBtnText: { ...typography.h3, color: colors.bg, fontWeight: '700' },
-  btnDisabled:    { backgroundColor: colors.border, opacity: 0.5 },
+  btnDisabled:  { backgroundColor: colors.border, opacity: 0.5 },
 });

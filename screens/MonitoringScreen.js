@@ -11,9 +11,9 @@ import {
   connectToDevice, isConnected, accGate, extractFeatures,
 } from '../services/ble';
 import {
-  alarmDecision, mockPredict, resetAlarmState,
-  stageName, stageLabel, argmax,
+  alarmDecision, resetAlarmState, argmax,
 } from '../services/alarmEngine';
+import { loadModel, predict, isModelLoaded } from '../services/classifier';
 import {
   loadAlarmTime, loadCalibration, loadUserPrefs,
   saveSession, generateSessionId, todayDateStr,
@@ -27,6 +27,7 @@ export default function MonitoringScreen({ navigation }) {
 
   const [active, setActive]       = useState(false);
   const [bleOk, setBleOk]         = useState(false);
+  const [modelReady, setModelReady] = useState(false);
   const [currentStage, setStage]  = useState(null);    // 0,1,2
   const [probs, setProbs]         = useState([0.33,0.33,0.34]);
   const [action, setAction]       = useState('PRE_WINDOW');
@@ -49,6 +50,15 @@ export default function MonitoringScreen({ navigation }) {
     });
     loadUserPrefs().then(p => { prefsRef.current = p; });
     setBleOk(isConnected());
+
+    // Pre-load the ONNX model so first window is fast
+    if (!isModelLoaded()) {
+      loadModel()
+        .then(() => setModelReady(true))
+        .catch(e => console.warn('[Monitoring] Model load failed:', e));
+    } else {
+      setModelReady(true);
+    }
   }, []));
 
   // Pulse animation when active
@@ -96,7 +106,15 @@ export default function MonitoringScreen({ navigation }) {
     }
   }
 
-  const simRef = useRef(null);
+  // Simple heuristic used only if ONNX model fails to load
+  function _heuristicFallback(window) {
+    const mags = window.map(s => Math.sqrt((s.acc_x||0)**2+(s.acc_y||0)**2+(s.acc_z||0)**2));
+    const mean = mags.reduce((a,b)=>a+b,0)/mags.length;
+    const std  = Math.sqrt(mags.reduce((a,b)=>a+(b-mean)**2,0)/mags.length);
+    if (std > 0.3)  return [0.75, 0.20, 0.05];
+    if (std < 0.05) return [0.05, 0.40, 0.55];
+    return [0.15, 0.70, 0.15];
+  }
 
   function startSimulation() {
     simRef.current = setInterval(() => {
@@ -124,19 +142,23 @@ export default function MonitoringScreen({ navigation }) {
     }
   }
 
-  function handleWindow(window) {
+  async function handleWindow(window) {
     if (!active && !sessionRef.current) return;
 
-    // 1. ACC gate
+    // 1. ACC gate (rule-based, no model needed)
     const moving = accGate(window, prefsRef.current?.acc_threshold ?? 0.12);
     let rawProbs;
 
     if (moving) {
-      rawProbs = [0.90, 0.08, 0.02]; // Wake
+      rawProbs = [0.90, 0.08, 0.02];  // Hard-assign Wake
     } else {
-      // 2. Extract features + classify (mock)
-      const features = extractFeatures(window);
-      rawProbs = mockPredict(features, window);
+      // 2. Real ONNX inference (falls back to heuristic if model not ready)
+      try {
+        rawProbs = await predict(window);
+      } catch (e) {
+        console.warn('[Monitoring] Inference error, using heuristic:', e.message);
+        rawProbs = _heuristicFallback(window);
+      }
     }
 
     const now   = new Date();
@@ -271,7 +293,13 @@ export default function MonitoringScreen({ navigation }) {
         onPress={active ? stopMonitoring : startMonitoring}
         activeOpacity={0.85}
       >
-        <Text style={styles.mainBtnText}>{active ? 'Stop Monitoring' : 'Start Sleep Monitoring'}</Text>
+        <Text style={styles.mainBtnText}>
+          {active
+            ? 'Stop Monitoring'
+            : modelReady
+              ? 'Start Sleep Monitoring'
+              : 'Loading model…'}
+        </Text>
       </TouchableOpacity>
     </ScrollView>
   );

@@ -7,6 +7,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { colors, spacing, radius, typography } from '../theme';
 import { loadLastSession, loadRecentRatings, loadAlarmTime } from '../services/storage';
+import { checkAndScheduleWeeklyPVT } from '../services/pvtScheduler';
+
 
 const { width: SCREEN_W } = Dimensions.get('window');
 const CHART_W = SCREEN_W - spacing.lg * 2;
@@ -37,7 +39,9 @@ export default function HomeScreen({ navigation }) {
     setAlarmTime(time);
   }, []);
 
-  useFocusEffect(useCallback(() => { loadData(); }, [loadData]));
+  useFocusEffect(useCallback(() => { loadData(); 
+    checkAndScheduleWeeklyPVT();
+  }, [loadData]));
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -45,6 +49,8 @@ export default function HomeScreen({ navigation }) {
     setRefreshing(false);
   };
 
+
+  
   const avgRating = ratings.length > 0
     ? (ratings.reduce((a, r) => a + r.rating, 0) / ratings.length).toFixed(1)
     : null;

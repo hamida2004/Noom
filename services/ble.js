@@ -1,293 +1,418 @@
 /**
- * BLE Service — Empatica E4 Wristband
+ * ble.js — NOOM-BAND  v4
  *
- * The E4 exposes a GATT streaming service. UUIDs below are the standard
- * Empatica E4 BLE UUIDs. Adjust if using a different wristband.
- *
- * Data channels used by NOOM: BVP, ACC_X/Y/Z, TEMP, HR, IBI
+ * Changes vs previous version:
+ *  1. extractFeatures moved to features.js to break circular import with
+ *     classifier.js. Import it from there for any external use.
+ *  2. resetSubjectBuffer() imported from classifier.js and called in
+ *     connectToDevice() to clear the per-subject feature buffer on new session.
+ *  3. setOnDataCallback() REMOVED — was deprecated and only aliased to
+ *     setCalibrationCallback(). CalibrationScreen now uses setCalibrationCallback()
+ *     directly. No other callers existed.
+ *  4. All other logic unchanged (ticker, guards, parsers, accGate, callbacks).
  */
 
-import { BleManager, State } from 'react-native-ble-plx';
+import { BleManager } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
+import { Platform, PermissionsAndroid } from 'react-native';
+import { resetSubjectBuffer } from './classifier';
+import { extractFeatures } from './features';   // re-exported below for back-compat
 
-// ── Empatica E4 Service & Characteristic UUIDs ─────────────────────────────
-const E4_SERVICE_UUID            = 'FFFE';
-const E4_BVP_CHAR_UUID           = '2A37';   // Blood Volume Pulse
-const E4_ACC_CHAR_UUID           = '2A53';   // Accelerometer (X,Y,Z)
-const E4_TEMP_CHAR_UUID          = '2A6E';   // Temperature
-const E4_HR_CHAR_UUID            = '2A37';   // Heart Rate
-const E4_IBI_CHAR_UUID           = '2A92';   // Inter-beat Interval
-// ───────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Re-export extractFeatures so any existing import { extractFeatures } from
+// './ble' keeps working without changes.
+// ─────────────────────────────────────────────────────────────────────────────
+export { extractFeatures };
 
-const DEVICE_NAME_PREFIX = 'Empatica E4';
+// ─────────────────────────────────────────────────────────────────────────────
+// NOOM-BAND UUIDs — must match main.c exactly
+// ─────────────────────────────────────────────────────────────────────────────
+const DEVICE_NAME_PREFIX  = 'NOOM-BAND';
 
-let bleManager = null;
-let connectedDevice = null;
+const NOOM_STREAM_SERVICE = '12341234-5678-1234-1234-123456789abc';
+const NOOM_BVP_CHAR_UUID  = '11111111-1111-1111-1111-111111111111';
+const NOOM_ACC_CHAR_UUID  = '22222222-2222-2222-2222-222222222222';
+const NOOM_TEMP_CHAR_UUID = '33333333-3333-3333-3333-333333333333';
+const NOOM_HR_CHAR_UUID   = '44444444-4444-4444-4444-444444444444';
+const NOOM_IBI_CHAR_UUID  = '55555555-5555-5555-5555-555555555555';
 
-// Callbacks registered by consumers
-let onDataCallback = null;
-let onConnectionCallback = null;
-let onDisconnectCallback = null;
-
-// ─── 64 Hz rolling buffer (30 s = 1920 samples) ────────────────────────────
-// Each sample: { bvp, acc_x, acc_y, acc_z, temp, hr, ibi, ts }
+// ─────────────────────────────────────────────────────────────────────────────
+// Window / ticker parameters (must match Python training)
+// ─────────────────────────────────────────────────────────────────────────────
 const WINDOW_SIZE = 1920;
-const STEP_SIZE   = 960;  // 50% overlap
+const STEP_SIZE   = 960;
+const SAMPLE_MS   = 1000 / 64;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BLE state
+// ─────────────────────────────────────────────────────────────────────────────
+let bleManager            = null;
+let connectedDevice       = null;
+let onConnectionCallback  = null;
+let onDisconnectCallback  = null;
+
+let _monitoringCallback   = null;
+let _calibrationCallback  = null;
+
+/**
+ * Set by MonitoringScreen. Receives every BLE window for sleep inference.
+ */
+export function setMonitoringCallback(cb)  { _monitoringCallback  = cb; }
+
+/**
+ * Set by CalibrationScreen. Receives every BLE window during calibration.
+ * Runs in parallel with _monitoringCallback (both fire per window).
+ */
+export function setCalibrationCallback(cb) { _calibrationCallback = cb; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rolling buffer
+// ─────────────────────────────────────────────────────────────────────────────
 let sampleBuffer = [];
 let lastStep     = 0;
 
-function getBleManager() {
-  if (!bleManager) {
-    bleManager = new BleManager();
+// ─────────────────────────────────────────────────────────────────────────────
+// Latest values — held-last-value scheme: ticker stamps these at 64 Hz
+// ─────────────────────────────────────────────────────────────────────────────
+const latestValues = {
+  bvp: 0, acc_x: 0, acc_y: 0, acc_z: 0, temp: 36.0, hr: 60, ibi: 0,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Log throttle — one log per channel per second max
+// ─────────────────────────────────────────────────────────────────────────────
+const _lastLogTime = {};
+function _throttleLog(channel, message) {
+  const now = Date.now();
+  if (!_lastLogTime[channel] || now - _lastLogTime[channel] >= 1000) {
+    _lastLogTime[channel] = now;
+    console.log(message);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plausibility guards — out-of-range values keep previous good value
+// ─────────────────────────────────────────────────────────────────────────────
+const GUARDS = {
+  bvp:   { min: -50000, max: 50000 },
+  acc_x: { min: -8,     max: 8     },
+  acc_y: { min: -8,     max: 8     },
+  acc_z: { min: -8,     max: 8     },
+  temp:  { min: 10,     max: 45    },
+  hr:    { min: 20,     max: 250   },
+  ibi:   { min: 200,    max: 3000  },
+};
+
+function _guard(key, value) {
+  const g = GUARDS[key];
+  if (!g) return value;
+  if (!isFinite(value)) return latestValues[key];
+  if (value < g.min || value > g.max) {
+    console.warn(`[BLE] ${key} out of range: ${value} — keeping previous (${latestValues[key]})`);
+    return latestValues[key];
+  }
+  return value;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 64 Hz ticker — stamps latestValues into sampleBuffer
+// ─────────────────────────────────────────────────────────────────────────────
+let tickerHandle = null;
+
+function _startTicker() {
+  if (tickerHandle) return;
+  console.log('[BLE] 64 Hz ticker started');
+  tickerHandle = setInterval(() => {
+    _addToBuffer({ ...latestValues, ts: Date.now() });
+  }, SAMPLE_MS);
+}
+
+function _stopTicker() {
+  if (tickerHandle) {
+    clearInterval(tickerHandle);
+    tickerHandle = null;
+    console.log('[BLE] 64 Hz ticker stopped');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BleManager singleton
+// ─────────────────────────────────────────────────────────────────────────────
+function getBleManager() {
+  if (!bleManager) bleManager = new BleManager();
   return bleManager;
 }
 
-// ─── Public API ─────────────────────────────────────────────────────────────
+function _resetBleManager() {
+  try { bleManager?.destroy(); } catch (_) {}
+  bleManager = new BleManager();
+  console.log('[BLE] BleManager reset');
+}
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Permissions
+// ─────────────────────────────────────────────────────────────────────────────
+export async function requestBlePermissions() {
+  if (Platform.OS !== 'android') return true;
+  const apiLevel = parseInt(Platform.Version, 10);
+  if (apiLevel >= 31) {
+    const results = await PermissionsAndroid.requestMultiple([
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+    ]);
+    return Object.values(results).every(r => r === PermissionsAndroid.RESULTS.GRANTED);
+  } else {
+    const result = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+    );
+    return result === PermissionsAndroid.RESULTS.GRANTED;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BLE state check
+// ─────────────────────────────────────────────────────────────────────────────
 export async function checkBleState() {
-  return new Promise((resolve) => {
-    getBleManager().onStateChange((state) => {
-      resolve(state);
-    }, true);
+  return new Promise(resolve => {
+    getBleManager().onStateChange(state => resolve(state), true);
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Scanning
+// ─────────────────────────────────────────────────────────────────────────────
 export function scanForDevices(onFound, onError) {
-  const manager = getBleManager();
-  manager.startDeviceScan(null, { allowDuplicates: false }, (error, device) => {
-    if (error) {
-      console.error('[BLE] Scan error:', error);
-      onError?.(error);
-      return;
-    }
-    if (device && device.name && device.name.startsWith(DEVICE_NAME_PREFIX)) {
+  console.log('[BLE] Starting scan...');
+  getBleManager().startDeviceScan(
+    null,
+    { allowDuplicates: false, scanMode: 2 },
+    (error, device) => {
+      if (error) {
+        console.error('[BLE] Scan error:', error);
+        onError?.(error);
+        return;
+      }
+      if (!device) return;
+      const deviceName = device.name || device.localName || 'Unknown Device';
+      console.log('[BLE] Found device:', {
+        id: device.id, localName: device.localName,
+        name: device.name, rssi: device.rssi,
+      });
+      device.displayName = deviceName;
       onFound(device);
     }
-  });
+  );
 }
 
 export function stopScan() {
   getBleManager().stopDeviceScan();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Connect
+// ─────────────────────────────────────────────────────────────────────────────
 export async function connectToDevice(device, onData, onConnect, onDisconnect) {
-  onDataCallback       = onData;
-  onConnectionCallback = onConnect;
-  onDisconnectCallback = onDisconnect;
+  if (onData)       _monitoringCallback  = onData;
+  if (onConnect)    onConnectionCallback = onConnect;
+  if (onDisconnect) onDisconnectCallback = onDisconnect;
+
+  if (device === null) {
+    if (connectedDevice) {
+      console.log('[BLE] Reusing existing connection');
+      await _subscribeToCharacteristics(connectedDevice);
+    }
+    return connectedDevice;
+  }
+
+  sampleBuffer = [];
+  lastStep     = 0;
+  Object.assign(latestValues, {
+    bvp: 0, acc_x: 0, acc_y: 0, acc_z: 0, temp: 36.0, hr: 60, ibi: 0,
+  });
+  resetSubjectBuffer();   // v4: clear per-subject feature buffer for new session
 
   try {
     const connected = await device.connect({ autoConnect: false });
     await connected.discoverAllServicesAndCharacteristics();
     connectedDevice = connected;
+    console.log('[BLE] Connected:', connected.id);
 
-    // Monitor for disconnection
-    connected.onDisconnected((error, dev) => {
-      console.log('[BLE] Device disconnected:', dev?.id);
+    connected.onDisconnected((_err, dev) => {
+      console.log('[BLE] Disconnected:', dev?.id);
       connectedDevice = null;
+      _stopTicker();
+      Object.assign(latestValues, {
+        bvp: 0, acc_x: 0, acc_y: 0, acc_z: 0, temp: 36.0, hr: 60, ibi: 0,
+      });
+      sampleBuffer = [];
+      lastStep     = 0;
+      resetSubjectBuffer();   // v4: also clear on disconnect so reconnect starts fresh
       onDisconnectCallback?.('disconnected');
+      _resetBleManager();
     });
 
-    // Subscribe to all channels
     await _subscribeToCharacteristics(connected);
-
+    _startTicker();
     onConnectionCallback?.('connected', connected);
     return connected;
+
   } catch (error) {
     console.error('[BLE] Connection failed:', error);
     throw error;
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Disconnect
+// ─────────────────────────────────────────────────────────────────────────────
 export async function disconnectDevice() {
+  _stopTicker();
   if (connectedDevice) {
-    await connectedDevice.cancelConnection();
+    try { await connectedDevice.cancelConnection(); } catch (_) {}
     connectedDevice = null;
   }
+  _resetBleManager();
 }
 
-export function isConnected() {
-  return connectedDevice !== null;
+export function isConnected()        { return connectedDevice !== null; }
+export function getConnectedDevice() { return connectedDevice; }
+export function resetBuffer()        { sampleBuffer = []; lastStep = 0; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getRawSample — snapshot of latest sensor values
+// ─────────────────────────────────────────────────────────────────────────────
+export function getRawSample() {
+  return { ...latestValues, ts: Date.now() };
 }
 
-export function getConnectedDevice() {
-  return connectedDevice;
-}
-
-// ─── Private helpers ─────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Subscribe to characteristics
+// ─────────────────────────────────────────────────────────────────────────────
 async function _subscribeToCharacteristics(device) {
   const services = await device.services();
-  console.log('[BLE] Services found:', services.map(s => s.uuid));
+  console.log('[BLE] Services:', services.map(s => s.uuid));
 
-  // Subscribe BVP
-  _monitorCharacteristic(device, E4_SERVICE_UUID, E4_BVP_CHAR_UUID, (val) => {
-    _pushSample('bvp', _parseFloat32(val));
+  _monitor(device, NOOM_STREAM_SERVICE, NOOM_BVP_CHAR_UUID, buf => {
+    const val = _guard('bvp', _parseFloat32(buf));
+    latestValues.bvp = val;
+    _throttleLog('bvp', `[BLE] BVP  = ${val.toFixed(2)}`);
   });
 
-  // Subscribe ACC (3-axis packed)
-  _monitorCharacteristic(device, E4_SERVICE_UUID, E4_ACC_CHAR_UUID, (val) => {
-    const [x, y, z] = _parseAccelerometer(val);
-    _pushSampleMulti({ acc_x: x, acc_y: y, acc_z: z });
+  _monitor(device, NOOM_STREAM_SERVICE, NOOM_ACC_CHAR_UUID, buf => {
+    const [x, y, z] = _parseMPU6050Accel(buf);
+    latestValues.acc_x = _guard('acc_x', x);
+    latestValues.acc_y = _guard('acc_y', y);
+    latestValues.acc_z = _guard('acc_z', z);
+    _throttleLog('acc',
+      `[BLE] ACC  x=${latestValues.acc_x.toFixed(4)}g  y=${latestValues.acc_y.toFixed(4)}g  z=${latestValues.acc_z.toFixed(4)}g`
+    );
   });
 
-  // Subscribe TEMP
-  _monitorCharacteristic(device, E4_SERVICE_UUID, E4_TEMP_CHAR_UUID, (val) => {
-    _pushSample('temp', _parseFloat32(val));
+  _monitor(device, NOOM_STREAM_SERVICE, NOOM_TEMP_CHAR_UUID, buf => {
+    const val = _guard('temp', _parseFloat32(buf));
+    latestValues.temp = val;
+    _throttleLog('temp', `[BLE] TEMP = ${val.toFixed(2)} °C`);
   });
 
-  // Subscribe HR
-  _monitorCharacteristic(device, E4_SERVICE_UUID, E4_HR_CHAR_UUID, (val) => {
-    _pushSample('hr', _parseUint8(val));
+  _monitor(device, NOOM_STREAM_SERVICE, NOOM_HR_CHAR_UUID, buf => {
+    const val = _guard('hr', _parseUint8(buf));
+    latestValues.hr = val;
+    _throttleLog('hr', `[BLE] HR   = ${val} BPM`);
   });
 
-  // Subscribe IBI
-  _monitorCharacteristic(device, E4_SERVICE_UUID, E4_IBI_CHAR_UUID, (val) => {
-    _pushSample('ibi', _parseFloat32(val));
+  _monitor(device, NOOM_STREAM_SERVICE, NOOM_IBI_CHAR_UUID, buf => {
+    if (buf.length >= 4) {
+      const val = _guard('ibi', _parseFloat32(buf));
+      latestValues.ibi = val;
+      _throttleLog('ibi', `[BLE] IBI  = ${val.toFixed(1)} ms`);
+    }
   });
 }
 
-function _monitorCharacteristic(device, serviceUUID, charUUID, callback) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Generic monitor helper
+// ─────────────────────────────────────────────────────────────────────────────
+function _monitor(device, serviceUUID, charUUID, callback) {
   device.monitorCharacteristicForService(serviceUUID, charUUID, (error, char) => {
     if (error) {
-      // Non-fatal: some UUIDs may not be available
+      console.warn(`[BLE] Monitor error (${charUUID.slice(0, 8)}…):`, error.message);
       return;
     }
-    if (char?.value) {
-      const decoded = Buffer.from(char.value, 'base64');
-      callback(decoded);
-    }
+    if (char?.value) callback(Buffer.from(char.value, 'base64'));
   });
 }
 
-// Rolling sample assembly — fills gaps with NaN for missing channels
-let pendingSample = {};
-
-function _pushSample(channel, value) {
-  pendingSample[channel] = value;
-  _tryFlushSample();
-}
-
-function _pushSampleMulti(channels) {
-  Object.assign(pendingSample, channels);
-  _tryFlushSample();
-}
-
-function _tryFlushSample() {
-  const required = ['bvp', 'acc_x', 'acc_y', 'acc_z', 'temp', 'hr', 'ibi'];
-  const hasAll = required.every(k => pendingSample[k] !== undefined);
-  if (hasAll) {
-    const sample = { ...pendingSample, ts: Date.now() };
-    pendingSample = {};
-    _addToBuffer(sample);
-  }
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Buffer management
+//
+// Window fires when:
+//   • sampleBuffer has >= WINDOW_SIZE (1920) samples  AND
+//   • at least STEP_SIZE (960) new samples since the last window
+//
+// This gives 50% overlap: one 30-second window every 15 seconds.
+// Buffer is capped at 2×WINDOW_SIZE to avoid unbounded growth.
+// ─────────────────────────────────────────────────────────────────────────────
 function _addToBuffer(sample) {
   sampleBuffer.push(sample);
 
-  // Keep only last WINDOW_SIZE samples
   if (sampleBuffer.length > WINDOW_SIZE * 2) {
     sampleBuffer = sampleBuffer.slice(-WINDOW_SIZE * 2);
+    lastStep = Math.max(0, lastStep - WINDOW_SIZE);
   }
 
-  // Emit window every STEP_SIZE new samples
-  const newSamples = sampleBuffer.length - lastStep;
-  if (sampleBuffer.length >= WINDOW_SIZE && newSamples >= STEP_SIZE) {
-    const window = sampleBuffer.slice(-WINDOW_SIZE);
-    lastStep = sampleBuffer.length;
-    onDataCallback?.(window);
+  if (sampleBuffer.length >= WINDOW_SIZE) {
+    const newSamples = sampleBuffer.length - lastStep;
+    if (newSamples >= STEP_SIZE) {
+      const window = sampleBuffer.slice(-WINDOW_SIZE);
+      lastStep = sampleBuffer.length;
+      _monitoringCallback?.(window);
+      _calibrationCallback?.(window);
+    }
   }
 }
 
-// ─── Binary parsers ──────────────────────────────────────────────────────────
-
-function _parseFloat32(buffer) {
-  if (buffer.length < 4) return 0;
-  return buffer.readFloatLE(0);
+// ─────────────────────────────────────────────────────────────────────────────
+// Binary parsers
+// ─────────────────────────────────────────────────────────────────────────────
+function _parseFloat32(buf) {
+  if (buf.length < 4) return 0;
+  return buf.readFloatLE(0);
 }
 
-function _parseUint8(buffer) {
-  if (buffer.length < 1) return 0;
-  return buffer.readUInt8(0);
+function _parseUint8(buf) {
+  if (buf.length < 1) return 60;
+  return buf.readUInt8(0);
 }
 
-function _parseAccelerometer(buffer) {
-  // E4 packs ACC as 3x int16 little-endian, scaled by 64
-  if (buffer.length < 6) return [0, 0, 0];
-  const x = buffer.readInt16LE(0) / 64.0;
-  const y = buffer.readInt16LE(2) / 64.0;
-  const z = buffer.readInt16LE(4) / 64.0;
-  return [x, y, z];
-}
-
-// ─── ACC Gate (rule-based wake detection) ────────────────────────────────────
-// σ(‖a‖) > threshold → WAKE
-export function accGate(window, threshold = 0.12) {
-  const mags = window.map(s => Math.sqrt(
-    (s.acc_x || 0) ** 2 +
-    (s.acc_y || 0) ** 2 +
-    (s.acc_z || 0) ** 2
-  ));
-  const mean = mags.reduce((a, b) => a + b, 0) / mags.length;
-  const variance = mags.reduce((a, b) => a + (b - mean) ** 2, 0) / mags.length;
-  const std = Math.sqrt(variance);
-  return std > threshold;
-}
-
-// ─── Feature extraction (14 physiological features – Branch B) ───────────────
-export function extractFeatures(window) {
-  const acc_x = window.map(s => s.acc_x || 0);
-  const acc_y = window.map(s => s.acc_y || 0);
-  const acc_z = window.map(s => s.acc_z || 0);
-  const bvp   = window.map(s => s.bvp   || 0);
-  const hr    = window.map(s => s.hr    || 0);
-  const ibi   = window.map(s => s.ibi   || 0).filter(v => !isNaN(v) && v > 0);
-  const temp  = window.map(s => s.temp  || 0);
-
-  const mag   = acc_x.map((x, i) => Math.sqrt(x**2 + acc_y[i]**2 + acc_z[i]**2));
-
-  const mean   = arr => arr.reduce((a,b)=>a+b,0)/arr.length;
-  const std    = arr => { const m = mean(arr); return Math.sqrt(mean(arr.map(v=>(v-m)**2))); };
-  const ptp    = arr => Math.max(...arr) - Math.min(...arr);
-  const energy = arr => mean(arr.map(v=>v**2));
-
-  // HRV from IBI differences
-  let rmssd = 0, sdnn = 0;
-  if (ibi.length > 2) {
-    const diffs = ibi.slice(1).map((v, i) => v - ibi[i]);
-    rmssd = Math.sqrt(mean(diffs.map(d => d**2)));
-    sdnn  = std(ibi);
-  }
-
-  // TEMP linear slope (negative at N3 onset)
-  const n = temp.length;
-  const x_mean = (n - 1) / 2;
-  const slope = temp.reduce((acc, v, i) => acc + (i - x_mean) * (v - mean(temp)), 0) /
-                temp.reduce((acc, _, i) => acc + (i - x_mean)**2, 0);
-
-  // Low-movement ratio (fraction below P10 magnitude)
-  const sorted   = [...mag].sort((a,b)=>a-b);
-  const p10      = sorted[Math.floor(sorted.length * 0.1)];
-  const low_mov  = mag.filter(v => v <= p10 + 1e-6).length / mag.length;
-
-  const hr_std = std(hr);
-
+const MPU6050_SCALE = 16384.0;
+function _parseMPU6050Accel(buf) {
+  if (buf.length < 6) return [0, 0, 0];
   return [
-    mean(mag),           // 0: acc_mag_mean
-    std(mag),            // 1: acc_mag_std
-    ptp(mag),            // 2: acc_mag_range
-    ptp(acc_z),          // 3: acc_z_range (strongest N3 marker)
-    ptp(bvp),            // 4: bvp_range
-    energy(bvp),         // 5: bvp_energy
-    mean(hr),            // 6: hr_mean
-    hr_std,              // 7: hr_std
-    rmssd,               // 8: hrv_rmssd
-    sdnn,                // 9: hrv_sdnn
-    rmssd * hr_std,      // 10: hrv_instability
-    mean(temp),          // 11: temp_mean
-    slope,               // 12: temp_slope
-    low_mov,             // 13: low_mov_ratio
+    buf.readInt16LE(0) / MPU6050_SCALE,
+    buf.readInt16LE(2) / MPU6050_SCALE,
+    buf.readInt16LE(4) / MPU6050_SCALE,
   ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACC Gate
+//
+// Returns true (moving / awake) when the std-deviation of ACC magnitudes
+// across the window exceeds `threshold`.
+//
+// The threshold is calibrated by CalibrationScreen as the midpoint between:
+//   • the mean window-std during the "lie still" phase
+//   • the mean window-std during the "walk" phase
+//
+// This means the threshold and the gate output are in the same unit (g std),
+// so they are directly comparable.
+// ─────────────────────────────────────────────────────────────────────────────
+export function accGate(window, threshold = 0.12) {
+  const mags = window.map(s =>
+    Math.sqrt((s.acc_x || 0) ** 2 + (s.acc_y || 0) ** 2 + (s.acc_z || 0) ** 2)
+  );
+  const mean     = mags.reduce((a, b) => a + b, 0) / mags.length;
+  const variance = mags.reduce((a, b) => a + (b - mean) ** 2, 0) / mags.length;
+  return Math.sqrt(variance) > threshold;
 }

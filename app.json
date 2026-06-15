@@ -11,8 +11,8 @@
       "backgroundColor": "#050A14"
     },
     "assetBundlePatterns": [
-    "**/*",
-    "assets/model/*"
+      "**/*",
+      "assets/model/*"
     ],
     "ios": {
       "supportsTablet": false,
@@ -23,6 +23,7 @@
         "UIBackgroundModes": [
           "bluetooth-central",
           "fetch",
+          "audio",
           "remote-notification"
         ]
       }
@@ -57,6 +58,7 @@
       ],
       "expo-notifications",
       "expo-asset",
+      "@react-native-community/datetimepicker"
     ],
     "extra": {
       "eas": {

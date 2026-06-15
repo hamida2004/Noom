@@ -11,6 +11,8 @@ import CalibrationScreen from '../../screens/CalibrationScreen';
 import MonitoringScreen  from '../../screens/MonitoringScreen';
 import AlarmScreen       from '../../screens/AlarmScreen';
 import FeedbackScreen    from '../../screens/FeedbackScreen';
+import PVTScreen from '../../screens/PVTScreen';
+import { navigationRef } from '../../navigationRef';
 
 const Tab   = createBottomTabNavigator();
 const Stack = createStackNavigator();
@@ -63,6 +65,7 @@ function SetupStack() {
 export default function AppNavigator() {
   return (
     <NavigationContainer
+     ref={navigationRef}
       theme={{
         dark: true,
         colors: {
@@ -79,6 +82,7 @@ export default function AppNavigator() {
         <Stack.Screen name="Main"     component={MainTabs} options={{ presentation: 'card' }} />
         <Stack.Screen name="Alarm"    component={AlarmScreen} />
         <Stack.Screen name="Feedback" component={FeedbackScreen} />
+        <Stack.Screen name="PVT" component={PVTScreen} options={{ headerShown: false }} />
       </Stack.Navigator>
     </NavigationContainer>
   );

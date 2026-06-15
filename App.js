@@ -14,6 +14,11 @@ import { Buffer } from 'buffer';
 import AppNavigator from './src/navigation/AppNavigator';
 import OnnxWebViewBridge from './services/OnnxWebViewBridge';
 import { setBridge } from './services/classifier';
+import { navigationRef } from './navigationRef';    // createNavigationContainerRef()
+import { initPVTScheduler } from './services/pvtScheduler';
+
+// After notification permissions are granted:
+
 
 global.Buffer = Buffer;
 
@@ -29,6 +34,15 @@ Notifications.setNotificationHandler({
   }),
 });
 
+
+Notifications.setNotificationChannelAsync('alarm', {
+  name: 'Sleep Alarm',
+  importance: Notifications.AndroidImportance.MAX,
+  sound: 'alarm.wav',
+  vibrationPattern: [0, 500, 200, 500],
+  lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  bypassDnd: true,
+});
 // ─────────────────────────────────────────────────────────────────────────────
 // BLE + Notification Permissions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,6 +130,12 @@ export default function App() {
     setupPermissions();
 
   }, []);
+
+  useEffect(() => {
+  let cleanup;
+  initPVTScheduler({ navigationRef }).then(c => { cleanup = c; });
+  return () => cleanup?.();
+}, []);
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>

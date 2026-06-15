@@ -1,102 +1,79 @@
 /**
- * OnnxWebViewBridge.js
- * ====================
- * Runs ONNX inference inside a hidden WebView (real browser engine) so
- * onnxruntime-web's WebAssembly backend works without JSI/New-Arch issues.
+ * OnnxWebViewBridge.js — NOOM (Fixed for Large Models)
  *
- * FULLY OFFLINE — ort.min.js + all .wasm files are read from the app bundle
- * and injected as base64 data URIs. Zero network requests at runtime.
+ * FIX: The v4 CNN-TCN model is larger than v1. Passing it as a base64 string
+ * via injectJavaScript hits Android's IPC string limit (~1-2MB), silently
+ * truncating the string. This corrupts the ONNX protobuf, causing the WASM
+ * backend to crash and throw a raw C++ pointer (e.g., 16987040).
  *
- * Required assets (download once — see README below):
- *   assets/webview/ort.min.js
- *   assets/webview/ort-wasm.wasm
- *   assets/webview/ort-wasm-simd.wasm
- *   assets/webview/ort-wasm-simd-threaded.wasm
- *   assets/model/noom_model.onnx
- *   assets/model/noom_scalers.json
- *
- * Mount ONCE in App.js:
- *   const bridgeRef = useRef(null);
- *   useEffect(() => { setBridge(bridgeRef.current); }, []);
- *   return (
- *     <>
- *       <OnnxWebViewBridge ref={bridgeRef} />
- *       <NavigationContainer>...</NavigationContainer>
- *     </>
- *   );
- *
- * ─── Download commands (run from project root) ────────────────────────────────
- *   mkdir -p assets/webview
- *   V=1.20.1
- *   BASE="https://cdn.jsdelivr.net/npm/onnxruntime-web@$V/dist"
- *   curl -L "$BASE/ort.min.js"                        -o assets/webview/ort.min.js
- *   curl -L "$BASE/ort-wasm.wasm"                     -o assets/webview/ort-wasm.wasm
- *   curl -L "$BASE/ort-wasm-simd.wasm"                -o assets/webview/ort-wasm-simd.wasm
- *   curl -L "$BASE/ort-wasm-simd-threaded.wasm"       -o assets/webview/ort-wasm-simd-threaded.wasm
- * ─────────────────────────────────────────────────────────────────────────────
+ * SOLUTION: We now pass the local file URI (a very short string) to the WebView.
+ * The WebView uses XMLHttpRequest to load the file directly from the device
+ * storage, bypassing the base64 encoding and the IPC size limit entirely.
  */
 
-import React, { useRef, useState, useEffect, forwardRef, useImperativeHandle } from 'react';
+import React, { useRef, forwardRef, useImperativeHandle, useEffect } from 'react';
 import { View } from 'react-native';
 import { WebView } from 'react-native-webview';
-import * as FileSystem from 'expo-file-system/legacy';
 import { Asset } from 'expo-asset';
 
-// ── Module-scope requires — Metro must see these at parse time ────────────────
-const ORT_JS_ASSET    = require('../assets/webview/ort-runtime.bin'); // renamed from ort.min.js — Metro can't transform minified ORT
-const WASM_PLAIN      = require('../assets/webview/ort-wasm.wasm');
-const WASM_SIMD       = require('../assets/webview/ort-wasm-simd.wasm');
-const WASM_SIMD_THR   = require('../assets/webview/ort-wasm-simd-threaded.wasm');
-const ONNX_ASSET      = require('../assets/model/noom_model.onnx');
+const ONNX_ASSET = require('../assets/model/noom_model.onnx');
 
-// ── Pending inference map ─────────────────────────────────────────────────────
+const LOAD_TIMEOUT_MS    = 90_000;
+const PREDICT_TIMEOUT_MS = 20_000;
+
 const pending = new Map();
 let _msgId = 0;
 
-// ── Asset helpers ─────────────────────────────────────────────────────────────
-async function readB64(assetModule) {
+// Get the local file URI instead of reading as base64
+async function getModelLocalUri(assetModule) {
   const [asset] = await Asset.loadAsync(assetModule);
-  if (!asset.localUri) throw new Error('Asset has no localUri');
-  return FileSystem.readAsStringAsync(asset.localUri, {
-    encoding: 'base64',  // EncodingType enum is undefined in some expo-file-system versions
-  });
+  if (!asset.localUri) throw new Error('Asset has no localUri: ' + JSON.stringify(asset));
+  return asset.localUri;
 }
 
-// ── Build the full self-contained HTML string ─────────────────────────────────
-// All JS and WASM are inlined as base64 data URIs so the WebView never hits
-// the network. This takes a few seconds on first mount but runs fully offline.
-async function buildOfflineHtml() {
-  const [ortJs, wasmPlain, wasmSimd, wasmSimdThr] = await Promise.all([
-    readB64(ORT_JS_ASSET),
-    readB64(WASM_PLAIN),
-    readB64(WASM_SIMD),
-    readB64(WASM_SIMD_THR),
-  ]);
-
-  // Build data URIs
-  const ortJsSrc        = `data:text/javascript;base64,${ortJs}`;
-  const wasmPlainSrc    = `data:application/wasm;base64,${wasmPlain}`;
-  const wasmSimdSrc     = `data:application/wasm;base64,${wasmSimd}`;
-  const wasmSimdThrSrc  = `data:application/wasm;base64,${wasmSimdThr}`;
-
-  return `<!DOCTYPE html>
+// ── Bridge HTML ───────────────────────────────────────────────────────────────
+const BRIDGE_HTML = `<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"></head>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
 <body>
-<script src="${ortJsSrc}"></script>
 <script>
-(function () {
-  'use strict';
+  var _log = console.log.bind(console);
+  console.log = function() {
+    var m = Array.prototype.join.call(arguments, ' ');
+    _log(m);
+    try { window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'LOG', msg: m })); } catch(e) {}
+  };
+  var _err = console.error.bind(console);
+  console.error = function() {
+    var m = 'ERROR: ' + Array.prototype.join.call(arguments, ' ');
+    _err(m);
+    try { window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'LOG', msg: m })); } catch(e) {}
+  };
+</script>
 
-  // ── ort config: single-threaded, no SIMD, use our local WASM files ────────
+<script
+  src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"
+  crossorigin="anonymous"
+  onerror="window.ReactNativeWebView.postMessage(JSON.stringify({type:'ERROR',ctx:'CDN',error:'Failed to load ORT from CDN'}))"
+></script>
+
+<script>
+(function() {
+  console.log('Bridge runtime starting, ort defined: ' + (typeof ort !== 'undefined'));
+
+  if (typeof ort === 'undefined') {
+    window.ReactNativeWebView.postMessage(JSON.stringify({
+      type: 'ERROR', ctx: 'INIT', error: 'ort undefined after CDN script tag'
+    }));
+    return;
+  }
+
   ort.env.wasm.numThreads = 1;
   ort.env.wasm.simd       = false;
   ort.env.wasm.proxy      = false;
-  ort.env.wasm.wasmPaths  = {
-    'ort-wasm.wasm':                '${wasmPlainSrc}',
-    'ort-wasm-simd.wasm':           '${wasmSimdSrc}',
-    'ort-wasm-simd-threaded.wasm':  '${wasmSimdThrSrc}',
-  };
 
   var session = null;
 
@@ -104,121 +81,175 @@ async function buildOfflineHtml() {
     window.ReactNativeWebView.postMessage(JSON.stringify(obj));
   }
 
-  function b64ToBuffer(b64) {
-    var bin = atob(b64), n = bin.length, buf = new ArrayBuffer(n), u8 = new Uint8Array(buf);
-    for (var i = 0; i < n; i++) u8[i] = bin.charCodeAt(i);
-    return buf;
+  function softmax(arr) {
+    var m = Math.max.apply(null, arr);
+    var e = arr.map(function(v) { return Math.exp(v - m); });
+    var s = e.reduce(function(a, b) { return a + b; }, 0);
+    return e.map(function(v) { return v / s; });
   }
 
-  async function onMessage(ev) {
+  // Load local file using XHR (more reliable than fetch for file:// URIs in Android WebView)
+  function loadLocalFile(uri) {
+    return new Promise(function(resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', uri, true);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = function () {
+        if (xhr.status === 0 || xhr.status === 200) {
+          resolve(xhr.response);
+        } else {
+          reject(new Error('XHR failed with status: ' + xhr.status));
+        }
+      };
+      xhr.onerror = function () { reject(new Error('XHR network error')); };
+      xhr.send();
+    });
+  }
+
+  window.addEventListener('message', function(event) {
     var msg;
-    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    try { msg = JSON.parse(event.data); } catch(e) { return; }
+    if      (msg.type === 'LOAD_MODEL') handleLoad(msg);
+    else if (msg.type === 'PREDICT')    handlePredict(msg);
+  });
 
-    if (msg.type === 'LOAD_MODEL') {
-      try {
-        var buf = b64ToBuffer(msg.modelB64);
-        session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
+  async function handleLoad(msg) {
+    try {
+      if (session) {
         toRN({ type: 'MODEL_LOADED' });
-      } catch (e) {
-        toRN({ type: 'ERROR', ctx: 'LOAD_MODEL', error: e.message });
+        return;
       }
-      return;
-    }
-
-    if (msg.type === 'PREDICT') {
-      if (!session) { toRN({ type: 'PREDICT_ERROR', id: msg.id, error: 'No session' }); return; }
-      try {
-        var seqT  = new ort.Tensor('float32', new Float32Array(msg.scaledMatrix),   [1, msg.SEQ_LEN, msg.N_SIGNALS]);
-        var featT = new ort.Tensor('float32', new Float32Array(msg.scaledFeatures), [1, msg.N_FEAT]);
-        var out   = await session.run({ x_seq: seqT, x_feat: featT });
-        var logits = Array.from(out.logits.data);
-        var maxL  = Math.max.apply(null, logits);
-        var exps  = logits.map(function(v) { return Math.exp(v - maxL); });
-        var sum   = exps.reduce(function(a, b) { return a + b; }, 0);
-        var probs = exps.map(function(v) { return v / sum; });
-        toRN({ type: 'PREDICT_RESULT', id: msg.id, probs: probs });
-      } catch (e) {
-        toRN({ type: 'PREDICT_ERROR', id: msg.id, error: e.message });
+      console.log('Loading model from local URI: ' + msg.modelUri);
+      
+      // Load the file directly from storage (no base64, no size limit!)
+      var buf = await loadLocalFile(msg.modelUri);
+      console.log('Model buffer loaded: ' + buf.byteLength + ' bytes — creating InferenceSession...');
+      
+      session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
+      console.log('Session ready. Inputs: ' + session.inputNames.join(', ') + '  Outputs: ' + session.outputNames.join(', '));
+      toRN({ type: 'MODEL_LOADED' });
+    } catch(e) {
+      var errMsg = (e && e.message) ? e.message : String(e);
+      if (typeof e === 'number') {
+        errMsg = 'ORT WASM backend crashed (unsupported op or corrupted model). Code: ' + e;
       }
-      return;
+      console.error('handleLoad failed: ' + errMsg);
+      toRN({ type: 'ERROR', ctx: 'LOAD_MODEL', error: errMsg });
     }
   }
 
-  // Android fires 'message' on document, iOS on window — listen to both
-  document.addEventListener('message', onMessage);
-  window.addEventListener('message',   onMessage);
+  async function handlePredict(msg) {
+    if (!session) {
+      toRN({ type: 'PREDICT_ERROR', id: msg.id, error: 'No session loaded' });
+      return;
+    }
+    try {
+      var seqT  = new ort.Tensor('float32', new Float32Array(msg.scaledMatrix),   [1, msg.SEQ_LEN, msg.N_SIGNALS]);
+      var featT = new ort.Tensor('float32', new Float32Array(msg.scaledFeatures), [1, msg.N_FEAT]);
+      
+      // FIX: Use actual input names from the session to avoid hardcoding issues
+      var feeds = {};
+      feeds[session.inputNames[0]] = seqT;
+      feeds[session.inputNames[1]] = featT;
 
-  // Tell RN the context is alive
+      var out   = await session.run(feeds);
+      var key   = session.outputNames[0];
+      var probs = softmax(Array.from(out[key].data));
+      
+      toRN({ type: 'PREDICT_RESULT', id: msg.id, probs: probs });
+    } catch(e) {
+      console.error('handlePredict failed: ' + e.message);
+      toRN({ type: 'PREDICT_ERROR', id: msg.id, error: e.message });
+    }
+  }
+
   toRN({ type: 'WEBVIEW_READY' });
 })();
 </script>
 </body>
 </html>`;
-}
 
 // ── Component ─────────────────────────────────────────────────────────────────
 const OnnxWebViewBridge = forwardRef((_props, ref) => {
-  const webviewRef    = useRef(null);
-  const [html, setHtml] = useState(null);   // null until assets are read
+  const webviewRef = useRef(null);
 
-  // flags & queues
-  const wvReady     = useRef(false);
-  const mdLoaded    = useRef(false);
-  const mdLoading   = useRef(false);
-  const wvCbs       = useRef([]);
-  const mdCbs       = useRef([]);
+  const wvReady   = useRef(false);
+  const wvWaiters = useRef([]);
 
-  // ── Build HTML once on mount ───────────────────────────────────────────────
+  const mdLoadPromise = useRef(null);
+  const mdLoaded      = useRef(false);
+  const mdResolve     = useRef(null);
+  const mdReject      = useRef(null);
+
   useEffect(() => {
-    buildOfflineHtml()
-      .then(h => {
-        setHtml(h);
-        console.log('[OnnxBridge] offline HTML ready');
-      })
-      .catch(e => console.error('[OnnxBridge] buildOfflineHtml failed:', e));
+    console.log('[OnnxBridge] mounted — ORT will load from CDN');
   }, []);
 
-  // ── Expose API ─────────────────────────────────────────────────────────────
-  useImperativeHandle(ref, () => ({ loadModel, predict, isModelLoaded: () => mdLoaded.current }));
+  useImperativeHandle(ref, () => ({
+    loadModel,
+    predict,
+    isModelLoaded: () => mdLoaded.current,
+  }));
 
-  // ── Wait helpers ──────────────────────────────────────────────────────────
-  const waitWV = () => wvReady.current
-    ? Promise.resolve()
-    : new Promise((res, rej) => wvCbs.current.push({ res, rej }));
-
-  // ── loadModel ─────────────────────────────────────────────────────────────
-  async function loadModel() {
-    if (mdLoaded.current) return;
-    if (mdLoading.current) {
-      return new Promise((res, rej) => mdCbs.current.push({ res, rej }));
-    }
-    mdLoading.current = true;
-    try {
-      await waitWV();
-      const modelB64 = await readB64(ONNX_ASSET);
-      console.log('[OnnxBridge] Sending model to WebView...');
-      await new Promise((res, rej) => {
-        mdCbs.current.push({ res, rej });
-        _inject(JSON.stringify({ type: 'LOAD_MODEL', modelB64 }));
-      });
-      mdLoaded.current  = true;
-      mdLoading.current = false;
-      console.log('[OnnxBridge] Model loaded ✓');
-    } catch (err) {
-      mdLoading.current = false;
-      console.error('[OnnxBridge] loadModel error:', err);
-      mdCbs.current.forEach(cb => cb.rej(err));
-      mdCbs.current = [];
-      throw err;
-    }
+  function waitForWebView() {
+    if (wvReady.current) return Promise.resolve();
+    return new Promise((res, rej) => wvWaiters.current.push({ res, rej }));
   }
 
-  // ── predict ───────────────────────────────────────────────────────────────
-  async function predict(scaledMatrix, scaledFeatures, SEQ_LEN, N_SIGNALS, N_FEAT) {
-    if (!mdLoaded.current) await loadModel();
+  function loadModel() {
+    if (mdLoaded.current)      return Promise.resolve();
+    if (mdLoadPromise.current) return mdLoadPromise.current;
+
+    mdLoadPromise.current = (async () => {
+      console.log('[OnnxBridge] Waiting for WebView ready...');
+      await waitForWebView();
+
+      // Get the local file URI instead of reading base64
+      console.log('[OnnxBridge] Getting local URI for ONNX model...');
+      const modelUri = await getModelLocalUri(ONNX_ASSET);
+      console.log('[OnnxBridge] Model URI: ' + modelUri);
+
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          mdResolve.current = null;
+          mdReject.current  = null;
+          reject(new Error('[OnnxBridge] loadModel timed out after 90 s'));
+        }, LOAD_TIMEOUT_MS);
+
+        mdResolve.current = () => { clearTimeout(timer); resolve(); };
+        mdReject.current  = (e) => { clearTimeout(timer); reject(e); };
+
+        // Send the short URI string instead of the massive base64 string
+        _inject(JSON.stringify({ type: 'LOAD_MODEL', modelUri }));
+      });
+
+      mdLoaded.current = true;
+      console.log('[OnnxBridge] Model loaded ✓');
+    })().catch(e => {
+      mdLoadPromise.current = null;
+      mdLoaded.current      = false;
+      console.error('[OnnxBridge] loadModel failed:', e.message);
+      throw e;
+    });
+
+    return mdLoadPromise.current;
+  }
+
+  function predict(scaledMatrix, scaledFeatures, SEQ_LEN, N_SIGNALS, N_FEAT) {
+    if (!mdLoaded.current) {
+      return loadModel().then(() =>
+        predict(scaledMatrix, scaledFeatures, SEQ_LEN, N_SIGNALS, N_FEAT));
+    }
     return new Promise((resolve, reject) => {
-      const id = _msgId++;
-      pending.set(id, { resolve, reject });
+      const id    = _msgId++;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error('[OnnxBridge] predict timed out id=' + id));
+      }, PREDICT_TIMEOUT_MS);
+      pending.set(id, {
+        resolve: v => { clearTimeout(timer); resolve(v); },
+        reject:  e => { clearTimeout(timer); reject(e); },
+      });
       _inject(JSON.stringify({
         type: 'PREDICT', id,
         scaledMatrix:   Array.from(scaledMatrix),
@@ -228,77 +259,84 @@ const OnnxWebViewBridge = forwardRef((_props, ref) => {
     });
   }
 
-  // ── dispatch a message into the WebView ───────────────────────────────────
   function _inject(jsonStr) {
-    // JSON.stringify the payload again so it's a safe JS string literal
     const escaped = JSON.stringify(jsonStr);
-    webviewRef.current?.injectJavaScript(`
-      (function(){
-        var e = new MessageEvent('message', { data: ${escaped} });
-        document.dispatchEvent(e);
-      })();
-      true;
-    `);
+    webviewRef.current?.injectJavaScript(
+      `(function(){ window.postMessage(${escaped}, '*'); })(); true;`
+    );
   }
 
-  // ── Handle messages from WebView ──────────────────────────────────────────
   function onMessage(event) {
     let msg;
     try { msg = JSON.parse(event.nativeEvent.data); } catch { return; }
 
     switch (msg.type) {
+      case 'LOG':
+        console.log('[WV]', msg.msg);
+        break;
       case 'WEBVIEW_READY':
+        console.log('[OnnxBridge] WebView ready ✓');
         wvReady.current = true;
-        wvCbs.current.forEach(cb => cb.res());
-        wvCbs.current = [];
+        wvWaiters.current.forEach(w => w.res());
+        wvWaiters.current = [];
         break;
-
-      case 'MODEL_LOADED': {
-        const cb = mdCbs.current.shift();
-        cb?.res();
+      case 'MODEL_LOADED':
+        console.log('[OnnxBridge] MODEL_LOADED ✓');
+        mdResolve.current?.();
+        mdResolve.current = null;
+        mdReject.current  = null;
         break;
-      }
-
       case 'PREDICT_RESULT': {
         const p = pending.get(msg.id);
         if (p) { pending.delete(msg.id); p.resolve(msg.probs); }
         break;
       }
-
       case 'PREDICT_ERROR': {
         const p = pending.get(msg.id);
         if (p) { pending.delete(msg.id); p.reject(new Error(msg.error)); }
         break;
       }
-
       case 'ERROR':
-        console.error('[OnnxBridge WebView]', msg.ctx, msg.error);
-        if (msg.ctx === 'LOAD_MODEL') {
-          const cb = mdCbs.current.shift();
-          cb?.rej(new Error(msg.error));
+        console.error('[OnnxBridge] Error ctx=' + msg.ctx + ':', msg.error);
+        if (['LOAD_MODEL', 'CDN', 'INIT'].includes(msg.ctx)) {
+          _rejectLoad(msg.ctx + ': ' + msg.error);
         }
         break;
-
-      default: break;
     }
+  }
+
+  function _rejectLoad(reason) {
+    if (mdReject.current) {
+      mdReject.current(new Error(reason));
+      mdReject.current      = null;
+      mdResolve.current     = null;
+      mdLoadPromise.current = null;
+    }
+    wvWaiters.current.forEach(w => w.rej(new Error(reason)));
+    wvWaiters.current = [];
   }
 
   return (
     <View style={{ width: 0, height: 0, overflow: 'hidden' }}>
-      {html ? (
-        <WebView
-          ref={webviewRef}
-          originWhitelist={['*']}
-          source={{ html }}
-          onMessage={onMessage}
-          javaScriptEnabled
-          mixedContentMode="always"
-          allowFileAccessFromFileURLs
-          allowUniversalAccessFromFileURLs
-          style={{ width: 1, height: 1 }}
-          onError={e => console.error('[OnnxBridge] WebView error:', e.nativeEvent)}
-        />
-      ) : null}
+      <WebView
+        ref={webviewRef}
+        originWhitelist={['*']}
+        source={{ html: BRIDGE_HTML }}
+        onMessage={onMessage}
+        javaScriptEnabled
+        mixedContentMode="always"
+        allowFileAccessFromFileURLs={true}
+        allowUniversalAccessFromFileURLs={true}
+        style={{ width: 1, height: 1 }}
+        onError={e => {
+          console.error('[OnnxBridge] WebView error:', e.nativeEvent?.description);
+          _rejectLoad('WebView error: ' + e.nativeEvent?.description);
+        }}
+        onContentProcessDidTerminate={() => {
+          console.error('[OnnxBridge] WebView process terminated');
+          _rejectLoad('WebView process terminated');
+        }}
+      />
     </View>
   );
 });

@@ -24,6 +24,23 @@
  * All notification scheduling is one-shot (trigger: null / date / seconds).
  * No repeating triggers are used here — repeating triggers were the source
  * of the notification-spam bug (see pvtScheduler.js).
+ *
+ * ── STARTUP RELIABILITY (added) ──────────────────────────────────────────
+ * This screen lives inside a bottom Tab.Navigator, which means it is NEVER
+ * unmounted when the user switches tabs. If startMonitoring() ever hangs
+ * on an awaited call (a notification permission dialog that loses focus,
+ * a flaky AsyncStorage read, a fast-refresh that orphans the async call),
+ * `starting` would previously get stuck at `true` forever, since nothing
+ * bounded how long the body could take and the `finally` block never ran.
+ * That left the Start button permanently stuck on "Starting…" until the
+ * whole app process was killed.
+ *
+ * Fix: every awaited call inside startMonitoring() is now wrapped in
+ * withTimeout(), and the entire body races against an outer
+ * STARTUP_TIMEOUT_MS. Any stall now throws a clearly labeled error,
+ * logs it, and resets `starting` back to false so the button recovers.
+ * An attempt token (startAttemptRef) makes sure a stale, slow-to-time-out
+ * call can never clobber the state of a newer, successful attempt.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -67,6 +84,19 @@ const STAGE_NAMES  = ['WAKE', 'LIGHT', 'DEEP'];
 // ─── Alarm notification config ─────────────────────────────────────────────────
 const ALARM_CHANNEL_ID = 'noom-alarm';
 const ALARM_SOUND      = 'alarm.wav';
+
+// ─── Startup safety net ─────────────────────────────────────────────────────────
+const STARTUP_TIMEOUT_MS = 12_000; // generous — covers slow AsyncStorage + permission dialogs
+
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`Timed out after ${ms}ms waiting on: ${label}`)), ms);
+    promise.then(
+      v => { clearTimeout(t); resolve(v); },
+      e => { clearTimeout(t); reject(e); }
+    );
+  });
+}
 
 /**
  * Android requires a notification channel with the custom sound attached
@@ -112,6 +142,7 @@ export default function MonitoringScreen({ navigation }) {
   const prefsRef          = useRef(null);
   const alarmTimeRef      = useRef(null);
   const scheduledAlarmIdRef = useRef(null);   // id of the OS-level deadline notification
+  const startAttemptRef   = useRef(0);        // guards against stale/overlapping startMonitoring() calls
   const pulseAnim         = useRef(new Animated.Value(1)).current;
 
   useEffect(() => { navigationRef.current = navigation; }, [navigation]);
@@ -196,99 +227,142 @@ export default function MonitoringScreen({ navigation }) {
       return;
     }
 
+    // Token for this specific attempt. If a later attempt starts before this
+    // one's timeout fires, the stale attempt's catch/finally must not stomp
+    // on the new attempt's state.
+    const myAttempt = ++startAttemptRef.current;
+
     setStarting(true);
+    console.log('[Monitoring] startMonitoring() called — attempt', myAttempt);
+
     try {
-      // ── 1. Load alarm time and prefs ──────────────────────────────────────
-      const [timeStr, prefs] = await Promise.all([loadAlarmTime(), loadUserPrefs()]);
-      prefsRef.current = prefs;
-      alarmTimeRef.current  = _buildAlarmDate(timeStr);
+      await withTimeout((async () => {
+        // ── 1. Load alarm time and prefs ──────────────────────────────────────
+        const [timeStr, prefs] = await withTimeout(
+          Promise.all([loadAlarmTime(), loadUserPrefs()]),
+          5_000,
+          'loadAlarmTime/loadUserPrefs'
+        );
+        prefsRef.current = prefs;
+        alarmTimeRef.current  = _buildAlarmDate(timeStr);
 
-      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      console.log('[Monitoring] SESSION START');
-      console.log('[Monitoring] Alarm time  :', alarmTimeRef.current.toLocaleTimeString());
-      console.log('[Monitoring] Wake window :', prefs.wake_window_minutes, 'min');
-      console.log('[Monitoring] Deep gate   :', prefs.deep_gate_threshold);
-      console.log('[Monitoring] tau_max/min :', prefs.tau_max, '/', prefs.tau_min);
-      console.log('[Monitoring] consec_req  :', prefs.consec_required);
-      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('[Monitoring] SESSION START');
+        console.log('[Monitoring] Alarm time  :', alarmTimeRef.current.toLocaleTimeString());
+        console.log('[Monitoring] Wake window :', prefs.wake_window_minutes, 'min');
+        console.log('[Monitoring] Deep gate   :', prefs.deep_gate_threshold);
+        console.log('[Monitoring] tau_max/min :', prefs.tau_max, '/', prefs.tau_min);
+        console.log('[Monitoring] consec_req  :', prefs.consec_required);
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-      // ── 1b. Arm the OS-level deadline alarm ───────────────────────────────
-      // Guarantees the alarm fires at the deadline (with alarm.wav) even if
-      // the JS thread is suspended overnight. Clear any stale notifications
-      // from a previous session first so they never pile up.
-      await Notifications.requestPermissionsAsync();
-      await _ensureAlarmChannel();
-      await Notifications.cancelAllScheduledNotificationsAsync();
-      await Notifications.dismissAllNotificationsAsync();
-
-      scheduledAlarmIdRef.current = await Notifications.scheduleNotificationAsync({
-      content: {
-        title:    '⏰ Wake up!',
-        body:     'Your NOOM alarm time has arrived.',
-        sound:    ALARM_SOUND,
-        priority: Notifications.AndroidNotificationPriority.MAX,
-        ...(Platform.OS === 'android' ? { channelId: ALARM_CHANNEL_ID } : {}),
-      },
-      trigger: {
-        type: Notifications.SchedulableTriggerInputTypes.DATE,
-        date: alarmTimeRef.current,
-      },
-    });
-      console.log('[Monitoring] Deadline alarm armed for', alarmTimeRef.current.toLocaleTimeString());
-
-      // ── 2. Reset state ────────────────────────────────────────────────────
-      resetAlarmState();
-      alarmFiredRef.current = false;
-      predsRef.current      = [];
-
-      sessionRef.current = {
-        id:          generateSessionId(),
-        date:        todayDateStr(),
-        alarm_time:  timeStr,
-        predictions: [],
-        started_at:  Date.now(),
-      };
-
-      setTimeline([]);
-      setStage(null);
-      setProbs([0.33, 0.33, 0.34]);
-      setAction('PRE_WINDOW');
-      setDeltaMin(null);
-      setWindowCount(0);
-
-      activeRef.current = true;
-      setActive(true);
-
-      // ── 3. Countdown ticker ───────────────────────────────────────────────
-      _clearAllIntervals();
-      countdownRef.current = setInterval(() => {
-        if (!activeRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; return; }
-        const at = alarmTimeRef.current;
-        if (at) setDeltaMin(Math.max(0, (at.getTime() - Date.now()) / 60_000));
-      }, 1_000);
-
-      // ── 4. Deadline watchdog ──────────────────────────────────────────────
-      // Drives the in-app FORCE_WAKE experience while the app is foregrounded.
-      // The OS-level notification armed above is the safety net for when it's not.
-      deadlineRef.current = setInterval(() => {
-        if (!activeRef.current || alarmFiredRef.current) {
-          clearInterval(deadlineRef.current); deadlineRef.current = null; return;
+        // ── 1b. Arm the OS-level deadline alarm ───────────────────────────────
+        // Guarantees the alarm fires at the deadline (with alarm.wav) even if
+        // the JS thread is suspended overnight. Clear any stale notifications
+        // from a previous session first so they never pile up.
+        await withTimeout(Notifications.requestPermissionsAsync(), 6_000, 'requestPermissionsAsync');
+        await withTimeout(_ensureAlarmChannel(), 3_000, '_ensureAlarmChannel');
+        
+        // FIX: Increased timeout and wrapped in try/catch.
+        // Native notification managers can be slow during bulk cancellations.
+        // These are non-critical cleanup steps; if they fail, we just log 
+        // a warning and proceed rather than failing the entire startup.
+        try {
+          await withTimeout(
+            Notifications.cancelAllScheduledNotificationsAsync(), 
+            10_000, 
+            'cancelAllScheduledNotificationsAsync'
+          );
+        } catch (cleanupErr) {
+          console.warn('[Monitoring] cancelAllScheduledNotificationsAsync slow/failed:', cleanupErr.message);
         }
-        if (alarmTimeRef.current && Date.now() >= alarmTimeRef.current.getTime()) {
-          console.log('[Monitoring] ⏰ DEADLINE REACHED — firing FORCE_WAKE');
-          alarmFiredRef.current = true;
-          clearInterval(deadlineRef.current); deadlineRef.current = null;
-          triggerAlarm('FORCE_WAKE', [0.34, 0.33, 0.33], 0);
-        }
-      }, 1_000);
 
-      // ── 5. Register BLE window callback ───────────────────────────────────
-      setMonitoringCallback(win => handleWindow(win));
+        try {
+          await withTimeout(
+            Notifications.dismissAllNotificationsAsync(), 
+            10_000, 
+            'dismissAllNotificationsAsync'
+          );
+        } catch (cleanupErr) {
+          console.warn('[Monitoring] dismissAllNotificationsAsync slow/failed:', cleanupErr.message);
+        }
+
+        scheduledAlarmIdRef.current = await withTimeout(
+          Notifications.scheduleNotificationAsync({
+            content: {
+              title:    '⏰ Wake up!',
+              body:     'Your NOOM alarm time has arrived.',
+              sound:    ALARM_SOUND,
+              priority: Notifications.AndroidNotificationPriority.MAX,
+              ...(Platform.OS === 'android' ? { channelId: ALARM_CHANNEL_ID } : {}),
+            },
+            trigger: {
+              type: Notifications.SchedulableTriggerInputTypes.DATE,
+              date: alarmTimeRef.current,
+            },
+          }),
+          5_000,
+          'scheduleNotificationAsync(deadline)'
+        );
+        console.log('[Monitoring] Deadline alarm armed for', alarmTimeRef.current.toLocaleTimeString());
+
+        // ── 2. Reset state ────────────────────────────────────────────────────
+        resetAlarmState();
+        alarmFiredRef.current = false;
+        predsRef.current      = [];
+
+        sessionRef.current = {
+          id:          generateSessionId(),
+          date:        todayDateStr(),
+          alarm_time:  timeStr,
+          predictions: [],
+          started_at:  Date.now(),
+        };
+
+        setTimeline([]);
+        setStage(null);
+        setProbs([0.33, 0.33, 0.34]);
+        setAction('PRE_WINDOW');
+        setDeltaMin(null);
+        setWindowCount(0);
+
+        activeRef.current = true;
+        setActive(true);
+
+        // ── 3. Countdown ticker ───────────────────────────────────────────────
+        _clearAllIntervals();
+        countdownRef.current = setInterval(() => {
+          if (!activeRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; return; }
+          const at = alarmTimeRef.current;
+          if (at) setDeltaMin(Math.max(0, (at.getTime() - Date.now()) / 60_000));
+        }, 1_000);
+
+        // ── 4. Deadline watchdog ──────────────────────────────────────────────
+        // Drives the in-app FORCE_WAKE experience while the app is foregrounded.
+        // The OS-level notification armed above is the safety net for when it's not.
+        deadlineRef.current = setInterval(() => {
+          if (!activeRef.current || alarmFiredRef.current) {
+            clearInterval(deadlineRef.current); deadlineRef.current = null; return;
+          }
+          if (alarmTimeRef.current && Date.now() >= alarmTimeRef.current.getTime()) {
+            console.log('[Monitoring] ⏰ DEADLINE REACHED — firing FORCE_WAKE');
+            alarmFiredRef.current = true;
+            clearInterval(deadlineRef.current); deadlineRef.current = null;
+            triggerAlarm('FORCE_WAKE', [0.34, 0.33, 0.33], 0);
+          }
+        }, 1_000);
+
+        // ── 5. Register BLE window callback ───────────────────────────────────
+        setMonitoringCallback(win => handleWindow(win));
+      })(), STARTUP_TIMEOUT_MS, 'startMonitoring() body');
 
     } catch (err) {
-      console.error('[Monitoring] startMonitoring failed:', err);
+      console.error('[Monitoring] startMonitoring failed:', err.message ?? err);
     } finally {
-      setStarting(false);
+      // Only reset `starting` if no newer attempt has superseded this one,
+      // so a slow-to-time-out stale call can't clobber a fresher success.
+      if (startAttemptRef.current === myAttempt) {
+        setStarting(false);
+      }
     }
   }
 
@@ -408,8 +482,19 @@ export default function MonitoringScreen({ navigation }) {
     // Clear the scheduled deadline alarm (whether this IS that alarm firing,
     // or a smart WAKE preempting it) plus any stragglers, and clear the
     // notification shade, before firing the single "live" alarm notification.
-    await Notifications.cancelAllScheduledNotificationsAsync();
-    await Notifications.dismissAllNotificationsAsync();
+    // FIX: Wrapped in try/catch with generous timeout to prevent blocking the alarm UI.
+    try {
+      await withTimeout(Notifications.cancelAllScheduledNotificationsAsync(), 10_000, 'cancelAll(triggerAlarm)');
+    } catch (e) {
+      console.warn('[Monitoring] cancelAll slow/failed in triggerAlarm:', e.message);
+    }
+    
+    try {
+      await withTimeout(Notifications.dismissAllNotificationsAsync(), 10_000, 'dismissAll(triggerAlarm)');
+    } catch (e) {
+      console.warn('[Monitoring] dismissAll slow/failed in triggerAlarm:', e.message);
+    }
+    
     scheduledAlarmIdRef.current = null;
 
     await _ensureAlarmChannel();

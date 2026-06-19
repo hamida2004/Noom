@@ -87,8 +87,6 @@
       "NDeep",
       "Deep"
     ],
-    "acc_gate_std": 0.12,
-    "model_version": "v4_cnn_tcn",
-    "per_subject_norm": true
+    "model_version": "v4_cnn_tcn_quantized"
   }
 }

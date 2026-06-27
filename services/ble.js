@@ -51,6 +51,24 @@ let connectedDevice       = null;
 let onConnectionCallback  = null;
 let onDisconnectCallback  = null;
 
+// True only while disconnectDevice() (the user tapping "Disconnect" on
+// SetupScreen) is actively running. Lets onDisconnected() below tell a
+// deliberate disconnect apart from an unexpected one (peripheral went out
+// of range, OS killed the background process, etc) so it knows whether to
+// attempt to reconnect.
+let _userInitiatedDisconnect = false;
+
+// Remembers the most recently connected device so an unexpected disconnect
+// can attempt to reconnect to the SAME device automatically, without the
+// user having to go back to SetupScreen and scan again.
+let _lastDevice = null;
+
+// Active BLE-state listeners, so they can be re-attached to a fresh
+// BleManager instance after _resetBleManager() destroys the old one.
+// Without this, anything subscribed via subscribeToBleState() would
+// silently stop receiving updates after the very next disconnect.
+const _stateListeners = new Set();
+
 let _monitoringCallback   = null;
 let _calibrationCallback  = null;
 
@@ -146,6 +164,11 @@ function getBleManager() {
 function _resetBleManager() {
   try { bleManager?.destroy(); } catch (_) {}
   bleManager = new BleManager();
+  // Re-attach any active state subscriptions to the new instance — see
+  // _stateListeners comment above for why this is necessary.
+  for (const listener of _stateListeners) {
+    bleManager.onStateChange(listener, true);
+  }
   console.log('[BLE] BleManager reset');
 }
 
@@ -177,6 +200,35 @@ export async function checkBleState() {
   return new Promise(resolve => {
     getBleManager().onStateChange(state => resolve(state), true);
   });
+}
+
+/**
+ * Subscribe to live BLE adapter state changes, using the SAME singleton
+ * BleManager instance that scanning/connecting/disconnecting use — not a
+ * second, independent BleManager.
+ *
+ * FIX: SetupScreen.js previously created its OWN separate BleManager just
+ * for this state listener ("a separate instance is fine" — it is not). A
+ * second, independent manager has no way to stay in sync with the one
+ * actually used for connections, so its reported state could silently
+ * drift — the UI then showed "Bluetooth off" / asked the user to turn BLE
+ * on even when it was genuinely on and connected, because it was asking
+ * the wrong object. (_resetBleManager() used to make this worse by
+ * rebuilding this module's manager on every disconnect; it no longer does
+ * — see onDisconnected()/disconnectDevice() below — but listeners still
+ * survive a manager rebuild via _stateListeners in case it's ever called
+ * manually for recovery purposes.)
+ *
+ * @param {(state: import('react-native-ble-plx').State) => void} listener
+ * @returns {() => void} unsubscribe function
+ */
+export function subscribeToBleState(listener) {
+  _stateListeners.add(listener);
+  const sub = getBleManager().onStateChange(listener, true);
+  return () => {
+    sub.remove();
+    _stateListeners.delete(listener);
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -236,6 +288,7 @@ export async function connectToDevice(device, onData, onConnect, onDisconnect) {
     const connected = await device.connect({ autoConnect: false });
     await connected.discoverAllServicesAndCharacteristics();
     connectedDevice = connected;
+    _lastDevice     = device;
     console.log('[BLE] Connected:', connected.id);
 
     connected.onDisconnected((_err, dev) => {
@@ -249,7 +302,29 @@ export async function connectToDevice(device, onData, onConnect, onDisconnect) {
       lastStep     = 0;
       resetSubjectBuffer();   // v4: also clear on disconnect so reconnect starts fresh
       onDisconnectCallback?.('disconnected');
-      _resetBleManager();
+
+      // FIX: _resetBleManager() used to run here unconditionally, on EVERY
+      // disconnect. Destroying and recreating the native BleManager as
+      // routine disconnect cleanup is what was leaving the device
+      // undiscoverable on reopening the app — some Android BLE stacks
+      // leave the adapter binding in a bad state after a manager is torn
+      // down and rebuilt outside of a real error condition, recoverable
+      // only by reloading the app or toggling Bluetooth off/on (exactly
+      // the symptom reported). The manager itself doesn't need replacing
+      // just because a peripheral disconnected — it stays alive and ready
+      // to scan/connect again immediately.
+      if (_userInitiatedDisconnect) {
+        _userInitiatedDisconnect = false;
+        return;
+      }
+
+      // Unexpected disconnect (out of range, peripheral reboot, OS
+      // background kill, etc) — per requirement, the device should stay
+      // connected unless the user explicitly disconnects from
+      // SetupScreen, so attempt to reconnect to the same device
+      // automatically rather than leaving the app silently disconnected.
+      console.log('[BLE] Unexpected disconnect — attempting auto-reconnect…');
+      _attemptReconnect();
     });
 
     await _subscribeToCharacteristics(connected);
@@ -264,15 +339,45 @@ export async function connectToDevice(device, onData, onConnect, onDisconnect) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Auto-reconnect — fires only after an UNEXPECTED disconnect (not one
+// initiated via disconnectDevice()). Retries with backoff since the
+// peripheral may take a moment to be reconnectable again (e.g. it just
+// came back into range).
+// ─────────────────────────────────────────────────────────────────────────────
+const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000]; // backoff schedule
+
+async function _attemptReconnect(attempt = 0) {
+  if (!_lastDevice || connectedDevice || _userInitiatedDisconnect) return;
+
+  try {
+    console.log(`[BLE] Reconnect attempt ${attempt + 1}/${RECONNECT_DELAYS_MS.length}…`);
+    await connectToDevice(_lastDevice, null, onConnectionCallback, onDisconnectCallback);
+    console.log('[BLE] Auto-reconnect succeeded');
+  } catch (e) {
+    console.warn('[BLE] Auto-reconnect attempt failed:', e.message);
+    if (attempt < RECONNECT_DELAYS_MS.length - 1) {
+      setTimeout(() => _attemptReconnect(attempt + 1), RECONNECT_DELAYS_MS[attempt]);
+    } else {
+      console.warn('[BLE] Auto-reconnect exhausted all attempts — giving up until user reconnects manually.');
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Disconnect
 // ─────────────────────────────────────────────────────────────────────────────
 export async function disconnectDevice() {
+  _userInitiatedDisconnect = true;
+  _lastDevice              = null;   // user's explicit choice — never auto-reconnect to it
   _stopTicker();
   if (connectedDevice) {
     try { await connectedDevice.cancelConnection(); } catch (_) {}
     connectedDevice = null;
   }
-  _resetBleManager();
+  // NOTE: _resetBleManager() removed here too — see the onDisconnected
+  // comment above. A clean, user-initiated disconnect doesn't need the
+  // native manager torn down and rebuilt; doing so was what made the
+  // device undiscoverable on next scan until an app reload or BLE toggle.
 }
 
 export function isConnected()        { return connectedDevice !== null; }

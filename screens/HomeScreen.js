@@ -2,13 +2,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, ScrollView, StyleSheet,
   TouchableOpacity, RefreshControl, Dimensions,
+  Image,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { colors, spacing, radius, typography } from '../theme';
 import { loadLastSession, loadRecentRatings, loadAlarmTime } from '../services/storage';
 import { checkAndScheduleWeeklyPVT } from '../services/pvtScheduler';
-
+import logo from '../assets/icon.png'
 
 const { width: SCREEN_W } = Dimensions.get('window');
 const CHART_W = SCREEN_W - spacing.lg * 2;
@@ -65,8 +66,11 @@ export default function HomeScreen({ navigation }) {
       <View style={styles.header}>
         <View>
           <Text style={styles.greeting}>{getGreeting()}</Text>
-          <Text style={styles.title}>NOOM</Text>
-        </View>
+          <Image
+          style={styles.image}
+          source={logo}
+          />
+             </View>
         <View style={styles.alarmBadge}>
           <Text style={styles.alarmBadgeLabel}>ALARM</Text>
           <Text style={styles.alarmBadgeTime}>{alarmTime}</Text>
@@ -247,8 +251,10 @@ const styles = StyleSheet.create({
   container:  { flex: 1, backgroundColor: colors.bg },
   content:    { padding: spacing.lg, paddingBottom: spacing.xxl },
 
-  header:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: spacing.lg },
-  greeting:   { ...typography.caption, marginBottom: 2 },
+  header:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.lg },
+  greeting:   { ...typography.caption, marginBottom: 2 ,
+   
+  },
   title:      { ...typography.displayMed, color: colors.primary },
   alarmBadge: { alignItems: 'flex-end', backgroundColor: colors.card, borderRadius: radius.md, padding: spacing.sm, borderWidth: 1, borderColor: colors.border },
   alarmBadgeLabel: { ...typography.label, color: colors.textSub },
@@ -290,4 +296,8 @@ const styles = StyleSheet.create({
   actionCard:  { flex: 1, backgroundColor: colors.card, borderRadius: radius.lg, padding: spacing.lg, alignItems: 'center', borderWidth: 1 },
   actionIcon:  { fontSize: 28, marginBottom: spacing.sm },
   actionLabel: { ...typography.h3 },
+  image:{
+    width:100,
+    height:100
+  }
 });

@@ -51,7 +51,14 @@ export default function FeedbackScreen({ navigation, route }) {
     }
     setSaved(true);
     setTimeout(() => {
-      navigation.reset({ index: 0, routes: [{ name: 'Main' }] });
+      // FIX: after rating, go straight into the PVT alertness check instead
+      // of resetting to Main. This makes PVT a natural next step in the
+      // wake-up flow rather than something that only ever appeared via a
+      // notification tap ~60s later. We use navigate (not reset) so the
+      // stack still has something underneath PVT — PVTScreen's own Skip
+      // button (navigation.goBack()) and its "done" action (which already
+      // resets to Main) both keep working unchanged.
+      navigation.navigate('PVT', { mode: 'post_alarm' });
     }, 1500);
   }
 

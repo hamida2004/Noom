@@ -1,32 +1,20 @@
 /**
- * SetupScreen.js — FIXED
- * =======================
+ * SetupScreen.js — FIXED (v2)
+ * ============================
  *
- * Fixes applied:
+ * All fixes from v1 retained, plus:
  *
- *  1. Live Bluetooth state listener replaces one-shot checkBleState().
- *     getBleManager().onStateChange(..., true) fires immediately with the
- *     current state AND fires again every time the user toggles Bluetooth.
- *     The UI dot and scan button now react instantly — no app restart needed.
+ *  8. FIX: "Please enable Bluetooth first" alert firing even when BLE is ON.
  *
- *  2. When Bluetooth turns ON while the screen is open, a scan is started
- *     automatically so the user doesn't have to tap anything.
+ *     Root cause: startScan() captured `bleReady` from the React state closure
+ *     at the time the function was created. When subscribeToBleState() fired
+ *     with PoweredOn, it called setBleReady(true) and then scheduled startScan()
+ *     via setTimeout(). But startScan still held the old closure value
+ *     (bleReady = false) from before the re-render, so the guard always failed.
  *
- *  3. Stray literal text "vs" removed from inside the JSX (was after
- *     </View> in the wristband card, causing a render error).
- *
- *  4. Scan timeout ref used instead of bare setTimeout so it can be
- *     cleared properly on unmount and on manual stop.
- *
- *  5. Second-module BleManager removed — we use getBleManager() from
- *     ble.js indirectly via checkBleState, but for the state listener
- *     we create one clean instance here and destroy it on unmount.
- *
- *  6. Manual NumberPicker replaced with @react-native-community/datetimepicker.
- *     On Android it opens as a clock dialog (mode="time"). On iOS it renders
- *     inline as a spinner. The selected time is stored in a Date object and
- *     serialised to "HH:MM" for storage — same format as before, fully
- *     compatible with loadAlarmTime() / saveAlarmTime().
+ *     Fix: a `bleReadyRef` ref is kept in sync with the `bleReady` state.
+ *     startScan() and stopScanning() now read from bleReadyRef.current, which
+ *     is always the live value regardless of when the function was captured.
  */
 
 import React, { useState, useEffect, useRef } from 'react';
@@ -40,19 +28,10 @@ import { colors, spacing, radius, typography } from '../theme';
 import {
   scanForDevices, stopScan,
   connectToDevice, disconnectDevice, isConnected, getConnectedDevice,
-  requestBlePermissions,
+  requestBlePermissions, subscribeToBleState,
 } from '../services/ble';
 import { loadAlarmTime, saveAlarmTime, loadCalibration } from '../services/storage';
-import { BleManager, State } from 'react-native-ble-plx';
-
-// Module-level BleManager used ONLY for the state listener.
-// A separate instance is fine — react-native-ble-plx allows multiple managers
-// as long as only one is used for scanning/connecting (that one lives in ble.js).
-let _stateManager = null;
-function getStateManager() {
-  if (!_stateManager) _stateManager = new BleManager();
-  return _stateManager;
-}
+import { State } from 'react-native-ble-plx';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,8 +54,8 @@ function dateToTimeStr(date) {
 /** Format a Date for the wake-window preview label. */
 function fmtTime(date) {
   return [
-    String(date.getHours()).padStart(2, '0'),
-    String(date.getMinutes()).padStart(2, '0'),
+    String(date.getHours()).padStart(2, '00'),
+    String(date.getMinutes()).padStart(2, '00'),
   ].join(':');
 }
 
@@ -94,21 +73,24 @@ export default function SetupScreen({ navigation }) {
   const [calibrated, setCalibrated]       = useState(false);
 
   // ── Alarm time state ───────────────────────────────────────────────────────
-  // alarmDate: the currently selected alarm time as a Date object.
-  // showPicker: Android only — controls whether the dialog is open.
-  //             On iOS the picker renders inline, so this is always true.
-  const [alarmDate,   setAlarmDate]   = useState(timeStrToDate('07:00'));
-  const [showPicker,  setShowPicker]  = useState(Platform.OS === 'ios');
+  const [alarmDate,  setAlarmDate]  = useState(timeStrToDate('07:00'));
+  const [showPicker, setShowPicker] = useState(Platform.OS === 'ios');
 
-  const devicesRef   = useRef({});
-  const scanTimeout  = useRef(null);
-  const stateUnsub   = useRef(null);
-  const prevBleReady = useRef(false);
+  const devicesRef  = useRef({});
+  const scanTimeout = useRef(null);
+  const stateUnsub  = useRef(null);
+  const hasBeenReady = useRef(false);
+
+  // ── FIX #8: ref that always mirrors the live bleReady state ───────────────
+  // React state updates are async; functions that capture `bleReady` from the
+  // closure can read a stale value. bleReadyRef.current is synchronously set
+  // alongside every setBleReady() call, so it is always current.
+  const bleReadyRef = useRef(false);
 
   useEffect(() => {
     _init();
     return () => {
-      stateUnsub.current?.remove();
+      stateUnsub.current?.();
       stopScan();
       clearTimeout(scanTimeout.current);
     };
@@ -123,35 +105,41 @@ export default function SetupScreen({ navigation }) {
       );
     }
 
-    stateUnsub.current = getStateManager().onStateChange((state) => {
+    stateUnsub.current = subscribeToBleState((state) => {
       const powered = state === State.PoweredOn;
+
+      // Always update both state (for UI) AND ref (for logic functions).
       setBleReady(powered);
+      bleReadyRef.current = powered;  // ← FIX #8
 
-      if (powered && !prevBleReady.current) {
-        prevBleReady.current = true;
-        setTimeout(() => startScan(), 500);
-      } else if (!powered) {
-        prevBleReady.current = false;
-        stopScan();
-        setScanning(false);
-        clearTimeout(scanTimeout.current);
-        if (Platform.OS === 'android') {
-          Alert.alert(
-            'Bluetooth turned off',
-            'Please enable Bluetooth to connect your NOOM wristband.',
-          );
+      if (powered) {
+        if (!hasBeenReady.current) {
+          hasBeenReady.current = true;
+          setTimeout(() => startScan(), 500);
+        } else {
+          setTimeout(() => startScan(), 500);
         }
+      } else {
+        if (hasBeenReady.current) {
+          stopScan();
+          setScanning(false);
+          clearTimeout(scanTimeout.current);
+          if (Platform.OS === 'android') {
+            Alert.alert(
+              'Bluetooth turned off',
+              'Please enable Bluetooth to connect your NOOM wristband.',
+            );
+          }
+        }
+        hasBeenReady.current = false;
       }
-    }, true);
+    });
 
-    // Load saved alarm time
     const saved = await loadAlarmTime();
     setAlarmDate(timeStrToDate(saved));
 
-    // Load calibration status
     loadCalibration().then(c => setCalibrated(!!c));
 
-    // Sync BLE connection state
     setConnected(isConnected());
     const dev = getConnectedDevice();
     if (dev) setConnectedName(dev.name ?? dev.localName ?? dev.id);
@@ -160,7 +148,8 @@ export default function SetupScreen({ navigation }) {
   // ── Scanning ──────────────────────────────────────────────────────────────
 
   function startScan() {
-    if (!bleReady) {
+    // FIX #8: read from ref, not from the `bleReady` state closure.
+    if (!bleReadyRef.current) {
       Alert.alert('Bluetooth off', 'Please enable Bluetooth first.');
       return;
     }
@@ -226,16 +215,8 @@ export default function SetupScreen({ navigation }) {
 
   // ── Alarm time ────────────────────────────────────────────────────────────
 
-  /**
-   * Called by DateTimePicker on every change.
-   *
-   * Android: fires once when the user confirms (or dismisses with event='dismissed').
-   *          We close the dialog in both cases.
-   * iOS:     fires on every scroll tick — no dialog, picker stays visible.
-   */
   function onTimeChange(event, selectedDate) {
     if (Platform.OS === 'android') {
-      // Always hide the dialog after interaction on Android
       setShowPicker(false);
       if (event.type === 'dismissed' || !selectedDate) return;
     }
@@ -248,7 +229,6 @@ export default function SetupScreen({ navigation }) {
     Alert.alert('Alarm saved', `Wake-up alarm set for ${timeStr}`);
   }
 
-  // Wake window preview: 30 min before the alarm
   const wakeWindowStart = new Date(alarmDate.getTime() - 30 * 60 * 1000);
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -371,7 +351,6 @@ export default function SetupScreen({ navigation }) {
             <SectionHeader title="ALARM TIME" />
             <View style={styles.card}>
 
-              {/* Android: show the selected time and a button to open the picker */}
               {Platform.OS === 'android' && (
                 <TouchableOpacity
                   style={styles.androidTimeDisplay}
@@ -383,10 +362,6 @@ export default function SetupScreen({ navigation }) {
                 </TouchableOpacity>
               )}
 
-              {/* DateTimePicker
-                    iOS:     always rendered inline (no dialog)
-                    Android: rendered as a modal clock dialog, shown only when
-                             showPicker is true                              */}
               {showPicker && (
                 <DateTimePicker
                   value={alarmDate}
@@ -394,9 +369,7 @@ export default function SetupScreen({ navigation }) {
                   is24Hour
                   display={Platform.OS === 'ios' ? 'spinner' : 'default'}
                   onChange={onTimeChange}
-                  // iOS inline spinner needs explicit dimensions
                   style={Platform.OS === 'ios' ? styles.iosPickerInline : undefined}
-                  // Tint the iOS spinner to match the app accent colour
                   accentColor={colors.primary}
                   textColor={colors.text}
                 />
@@ -486,9 +459,6 @@ const styles = StyleSheet.create({
   },
   calibNote:    { ...typography.body, color: colors.textSub, marginVertical: spacing.sm, fontSize: 13 },
 
-  // ── Alarm / time picker ────────────────────────────────────────────────────
-
-  // Android: tappable time display that opens the clock dialog
   androidTimeDisplay: {
     alignItems:      'center',
     paddingVertical: spacing.md,
@@ -499,18 +469,17 @@ const styles = StyleSheet.create({
     borderColor:     colors.border,
   },
   androidTimeValue: {
-    fontSize:    52,
-    fontWeight:  '800',
-    color:       colors.primary,
+    fontSize:      52,
+    fontWeight:    '800',
+    color:         colors.primary,
     letterSpacing: -1,
   },
   androidTimeHint: { ...typography.caption, color: colors.textSub, marginTop: 2 },
 
-  // iOS: inline spinner — needs a fixed height so it doesn't collapse
   iosPickerInline: {
-    width:         '100%',
-    height:        160,
-    marginBottom:  spacing.sm,
+    width:        '100%',
+    height:       160,
+    marginBottom: spacing.sm,
   },
 
   alarmPreview: { ...typography.caption, textAlign: 'center', marginBottom: spacing.md, color: colors.textSub },

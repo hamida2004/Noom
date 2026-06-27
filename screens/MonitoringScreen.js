@@ -25,22 +25,79 @@
  * No repeating triggers are used here — repeating triggers were the source
  * of the notification-spam bug (see pvtScheduler.js).
  *
- * ── STARTUP RELIABILITY (added) ──────────────────────────────────────────
- * This screen lives inside a bottom Tab.Navigator, which means it is NEVER
- * unmounted when the user switches tabs. If startMonitoring() ever hangs
- * on an awaited call (a notification permission dialog that loses focus,
- * a flaky AsyncStorage read, a fast-refresh that orphans the async call),
- * `starting` would previously get stuck at `true` forever, since nothing
- * bounded how long the body could take and the `finally` block never ran.
- * That left the Start button permanently stuck on "Starting…" until the
- * whole app process was killed.
+ * ── STARTUP RELIABILITY (v3 — diagnostic logging + non-blocking schedule) ─
+ * History of this section, newest first:
  *
- * Fix: every awaited call inside startMonitoring() is now wrapped in
- * withTimeout(), and the entire body races against an outer
- * STARTUP_TIMEOUT_MS. Any stall now throws a clearly labeled error,
- * logs it, and resets `starting` back to false so the button recovers.
- * An attempt token (startAttemptRef) makes sure a stale, slow-to-time-out
- * call can never clobber the state of a newer, successful attempt.
+ *  v3 (this version): scheduleNotificationAsync(deadline) was STILL timing
+ *  out at the bumped 8s ceiling on-device, inconsistently. Rather than keep
+ *  guessing at a magic timeout number, this version:
+ *    1. Makes scheduleNotificationAsync(deadline) fire-and-forget, same
+ *       reasoning as cancel/dismiss: it arms a *background safety-net*
+ *       alarm for if the JS thread is suspended. Its own slowness should
+ *       never block the live, in-app monitoring loop (state reset, BLE
+ *       callback registration, countdown ticker) from starting.
+ *    2. Adds explicit start/elapsed-time logging around EVERY notification
+ *       call (requestPermissions, ensureChannel, cancelAll, dismissAll,
+ *       scheduleNotificationAsync) with wall-clock timestamps, so the next
+ *       run shows exactly which call is slow and by how much, instead of
+ *       only learning about it after a timeout fires.
+ *    3. Adds the same logging to loadAlarmTime/loadUserPrefs, since a slow
+ *       AsyncStorage read would otherwise look identical to a slow
+ *       notification call in the logs.
+ *
+ *  v2: cancelAllScheduledNotificationsAsync / dismissAllNotificationsAsync
+ *  made fire-and-forget after they were observed hanging 10s+ on a
+ *  ColorOS/Realme device and starving the (then 12s) outer
+ *  STARTUP_TIMEOUT_MS race before scheduleNotificationAsync ever got a
+ *  chance to run. STARTUP_TIMEOUT_MS raised 12s → 20s.
+ *
+ *  v1: every awaited call wrapped in withTimeout() + outer
+ *  STARTUP_TIMEOUT_MS race, since this screen lives inside a
+ *  Tab.Navigator and is never unmounted — an unbounded hang previously
+ *  left the Start button stuck on "Starting…" forever.
+ *
+ * ── PREDICT CONCURRENCY GUARD (added) ─────────────────────────────────────
+ * ble.js's 64Hz ticker fires _monitoringCallback (→ handleWindow) every 15s
+ * via a fire-and-forget call — it does NOT await handleWindow. If a single
+ * predict() round-trip to the WebView ever runs long (or hangs), the next
+ * window's handleWindow() would previously start a SECOND concurrent
+ * predict() call, stacking unbounded injectJavaScript() calls into the
+ * WebView with no backpressure. predictingRef guards against this: a new
+ * window is logged and dropped (not queued) while a prediction is still in
+ * flight, rather than piling on.
+ *
+ * ── KNOWN ROOT CAUSE OF THE "APP FROZEN" BUG (fixed in OnnxWebViewBridge.js) ─
+ * Confirmed via logcat: Android's low-memory killer can kill the WebView's
+ * sandboxed Chromium renderer process mid-session on ColorOS/Realme
+ * devices ("Killing ...:sandboxed_process0:...(adj 905): remove task"),
+ * independent of anything this app does. When that happens mid-predict,
+ * the in-flight predict() promise previously hung forever — no
+ * PREDICT_RESULT could ever arrive from a renderer that no longer exists.
+ * OnnxWebViewBridge.js now detects this (onContentProcessDidTerminate) and
+ * rejects all in-flight predicts + forces a reload on the next call. See
+ * that file's header for full detail. handleWindow()'s catch block below
+ * will now log a real "WebView process died" error instead of the whole
+ * session silently hanging.
+ *
+ * ── triggerAlarm() RELIABILITY (v4 — non-blocking navigation) ─────────────
+ * triggerAlarm() previously awaited cancelAllScheduledNotificationsAsync()
+ * and dismissAllNotificationsAsync() SEQUENTIALLY, each with its own 10s
+ * timeout, before doing anything else — including navigating to the Alarm
+ * screen. On a device where both calls are slow (same class of hang as the
+ * v2 fix in startMonitoring() above, e.g. ColorOS/Realme), this meant up to
+ * ~20+ seconds of dead time between the model deciding WAKE and the user
+ * ever seeing the Alarm screen, with the live alarm notification posting
+ * even later than that. This is almost certainly why "the alarm doesn't
+ * fire correctly" — it DOES fire, just 20+ seconds late, hidden behind two
+ * back-to-back await'd timeouts.
+ *
+ * Fix: apply the exact same lesson as v2 of startMonitoring(). Navigation
+ * to the Alarm screen and posting the actual "live alarm" notification
+ * (the one the user needs to see/hear NOW) happen FIRST and are not gated
+ * on cleanup. cancelAll/dismissAll of stale notifications become
+ * fire-and-forget — they only matter for tidiness (clearing old scheduled
+ * notifications from the shade), not for the user's alarm experience, so
+ * their slowness must never block it.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -57,7 +114,7 @@ import { colors, spacing, radius, typography } from '../theme';
 import { isConnected, accGate, setMonitoringCallback } from '../services/ble';
 import { alarmDecision, resetAlarmState, argmax } from '../services/alarmEngine';
 import { loadModel, predict, isModelLoaded } from '../services/classifier';
-import { scheduleOptionalPVT } from '../services/pvtScheduler';
+import { navigationRef as rootNavigationRef } from '../navigationRef';
 import {
   loadAlarmTime, loadUserPrefs,
   saveSession, generateSessionId, todayDateStr,
@@ -86,7 +143,7 @@ const ALARM_CHANNEL_ID = 'noom-alarm';
 const ALARM_SOUND      = 'alarm.wav';
 
 // ─── Startup safety net ─────────────────────────────────────────────────────────
-const STARTUP_TIMEOUT_MS = 12_000; // generous — covers slow AsyncStorage + permission dialogs
+const STARTUP_TIMEOUT_MS = 20_000;
 
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
@@ -98,12 +155,22 @@ function withTimeout(promise, ms, label) {
   });
 }
 
-/**
- * Android requires a notification channel with the custom sound attached
- * for it to actually play (the `sound` field on the content alone is not
- * enough on Android 8+). No-op on iOS — there the `sound` field on the
- * content is sufficient as long as the file is bundled into the app.
- */
+// ─── Diagnostic timing helper ──────────────────────────────────────────────────
+function timed(promise, label) {
+  const startedAt = Date.now();
+  console.log(`[Timing] ${label} — START @ ${new Date(startedAt).toLocaleTimeString()}`);
+  return promise.then(
+    v => {
+      console.log(`[Timing] ${label} — DONE in ${Date.now() - startedAt}ms`);
+      return v;
+    },
+    e => {
+      console.log(`[Timing] ${label} — FAILED after ${Date.now() - startedAt}ms: ${e.message ?? e}`);
+      throw e;
+    }
+  );
+}
+
 async function _ensureAlarmChannel() {
   if (Platform.OS !== 'android') return;
   await Notifications.setNotificationChannelAsync(ALARM_CHANNEL_ID, {
@@ -119,7 +186,6 @@ async function _ensureAlarmChannel() {
 export default function MonitoringScreen({ navigation }) {
   const insets = useSafeAreaInsets();
 
-  // ── UI state ──────────────────────────────────────────────────────────────
   const [active,       setActive]     = useState(false);
   const [bleOk,        setBleOk]      = useState(false);
   const [modelReady,   setModelReady] = useState(false);
@@ -129,10 +195,8 @@ export default function MonitoringScreen({ navigation }) {
   const [action,       setAction]     = useState('PRE_WINDOW');
   const [deltaMin,     setDeltaMin]   = useState(null);
   const [timeline,     setTimeline]   = useState([]);
-  const [windowCount,  setWindowCount]= useState(0);   // how many windows processed
+  const [windowCount,  setWindowCount]= useState(0);
 
-  // ── Refs ──────────────────────────────────────────────────────────────────
-  const navigationRef     = useRef(navigation);
   const activeRef         = useRef(false);
   const alarmFiredRef     = useRef(false);
   const sessionRef        = useRef(null);
@@ -141,17 +205,15 @@ export default function MonitoringScreen({ navigation }) {
   const predsRef          = useRef([]);
   const prefsRef          = useRef(null);
   const alarmTimeRef      = useRef(null);
-  const scheduledAlarmIdRef = useRef(null);   // id of the OS-level deadline notification
-  const startAttemptRef   = useRef(0);        // guards against stale/overlapping startMonitoring() calls
+  const scheduledAlarmIdRef = useRef(null);
+  const startAttemptRef   = useRef(0);
+  const predictingRef     = useRef(false);
   const pulseAnim         = useRef(new Animated.Value(1)).current;
 
-  useEffect(() => { navigationRef.current = navigation; }, [navigation]);
   useEffect(() => { activeRef.current = active; }, [active]);
 
-  // ── Cleanup on unmount ────────────────────────────────────────────────────
   useEffect(() => () => { _clearAllIntervals(); setMonitoringCallback(null); }, []);
 
-  // ── Load model on focus ───────────────────────────────────────────────────
   useFocusEffect(useCallback(() => {
     const connected = isConnected();
     setBleOk(connected);
@@ -165,7 +227,6 @@ export default function MonitoringScreen({ navigation }) {
     }
   }, []));
 
-  // ── Pulse animation ───────────────────────────────────────────────────────
   useEffect(() => {
     if (active) {
       const loop = Animated.loop(
@@ -180,7 +241,6 @@ export default function MonitoringScreen({ navigation }) {
     pulseAnim.setValue(1);
   }, [active]);
 
-  // ── Background fetch ──────────────────────────────────────────────────────
   useEffect(() => {
     BackgroundFetch.registerTaskAsync(BG_TASK, {
       minimumInterval: 15,
@@ -190,15 +250,14 @@ export default function MonitoringScreen({ navigation }) {
     return () => { BackgroundFetch.unregisterTaskAsync(BG_TASK).catch(() => {}); };
   }, []);
 
-  // ── AppState ──────────────────────────────────────────────────────────────
   useEffect(() => {
     const sub = AppState.addEventListener('change', s => {
+      console.log('[Monitoring] AppState changed →', s);
       if (s === 'active') setBleOk(isConnected());
     });
     return () => sub.remove();
   }, []);
 
-  // ─────────────────────────────────────────────────────────────────────────
   function _clearAllIntervals() {
     if (deadlineRef.current)  { clearInterval(deadlineRef.current);  deadlineRef.current  = null; }
     if (countdownRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; }
@@ -212,9 +271,6 @@ export default function MonitoringScreen({ navigation }) {
     return d;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // startMonitoring
-  // ─────────────────────────────────────────────────────────────────────────
   async function startMonitoring() {
     if (active || starting) return;
 
@@ -227,20 +283,20 @@ export default function MonitoringScreen({ navigation }) {
       return;
     }
 
-    // Token for this specific attempt. If a later attempt starts before this
-    // one's timeout fires, the stale attempt's catch/finally must not stomp
-    // on the new attempt's state.
     const myAttempt = ++startAttemptRef.current;
 
     setStarting(true);
-    console.log('[Monitoring] startMonitoring() called — attempt', myAttempt);
+    const attemptStartedAt = Date.now();
+    console.log(`[Monitoring] startMonitoring() called — attempt ${myAttempt} @ ${new Date(attemptStartedAt).toLocaleTimeString()}`);
 
     try {
       await withTimeout((async () => {
-        // ── 1. Load alarm time and prefs ──────────────────────────────────────
-        const [timeStr, prefs] = await withTimeout(
-          Promise.all([loadAlarmTime(), loadUserPrefs()]),
-          5_000,
+        const [timeStr, prefs] = await timed(
+          withTimeout(
+            Promise.all([loadAlarmTime(), loadUserPrefs()]),
+            5_000,
+            'loadAlarmTime/loadUserPrefs'
+          ),
           'loadAlarmTime/loadUserPrefs'
         );
         prefsRef.current = prefs;
@@ -255,38 +311,21 @@ export default function MonitoringScreen({ navigation }) {
         console.log('[Monitoring] consec_req  :', prefs.consec_required);
         console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-        // ── 1b. Arm the OS-level deadline alarm ───────────────────────────────
-        // Guarantees the alarm fires at the deadline (with alarm.wav) even if
-        // the JS thread is suspended overnight. Clear any stale notifications
-        // from a previous session first so they never pile up.
-        await withTimeout(Notifications.requestPermissionsAsync(), 6_000, 'requestPermissionsAsync');
-        await withTimeout(_ensureAlarmChannel(), 3_000, '_ensureAlarmChannel');
-        
-        // FIX: Increased timeout and wrapped in try/catch.
-        // Native notification managers can be slow during bulk cancellations.
-        // These are non-critical cleanup steps; if they fail, we just log 
-        // a warning and proceed rather than failing the entire startup.
-        try {
-          await withTimeout(
-            Notifications.cancelAllScheduledNotificationsAsync(), 
-            10_000, 
-            'cancelAllScheduledNotificationsAsync'
-          );
-        } catch (cleanupErr) {
-          console.warn('[Monitoring] cancelAllScheduledNotificationsAsync slow/failed:', cleanupErr.message);
-        }
+        await timed(
+          withTimeout(Notifications.requestPermissionsAsync(), 6_000, 'requestPermissionsAsync'),
+          'requestPermissionsAsync'
+        );
+        await timed(
+          withTimeout(_ensureAlarmChannel(), 3_000, '_ensureAlarmChannel'),
+          '_ensureAlarmChannel'
+        );
 
-        try {
-          await withTimeout(
-            Notifications.dismissAllNotificationsAsync(), 
-            10_000, 
-            'dismissAllNotificationsAsync'
-          );
-        } catch (cleanupErr) {
-          console.warn('[Monitoring] dismissAllNotificationsAsync slow/failed:', cleanupErr.message);
-        }
+        timed(Notifications.cancelAllScheduledNotificationsAsync(), 'cancelAllScheduledNotificationsAsync(bg)')
+          .catch(e => console.warn('[Monitoring] cancelAllScheduledNotificationsAsync failed:', e.message));
+        timed(Notifications.dismissAllNotificationsAsync(), 'dismissAllNotificationsAsync(bg)')
+          .catch(e => console.warn('[Monitoring] dismissAllNotificationsAsync failed:', e.message));
 
-        scheduledAlarmIdRef.current = await withTimeout(
+        timed(
           Notifications.scheduleNotificationAsync({
             content: {
               title:    '⏰ Wake up!',
@@ -300,12 +339,14 @@ export default function MonitoringScreen({ navigation }) {
               date: alarmTimeRef.current,
             },
           }),
-          5_000,
-          'scheduleNotificationAsync(deadline)'
-        );
-        console.log('[Monitoring] Deadline alarm armed for', alarmTimeRef.current.toLocaleTimeString());
+          'scheduleNotificationAsync(deadline)(bg)'
+        )
+          .then(id => {
+            scheduledAlarmIdRef.current = id;
+            console.log('[Monitoring] Deadline alarm armed for', alarmTimeRef.current.toLocaleTimeString());
+          })
+          .catch(e => console.warn('[Monitoring] scheduleNotificationAsync(deadline) failed:', e.message));
 
-        // ── 2. Reset state ────────────────────────────────────────────────────
         resetAlarmState();
         alarmFiredRef.current = false;
         predsRef.current      = [];
@@ -328,7 +369,6 @@ export default function MonitoringScreen({ navigation }) {
         activeRef.current = true;
         setActive(true);
 
-        // ── 3. Countdown ticker ───────────────────────────────────────────────
         _clearAllIntervals();
         countdownRef.current = setInterval(() => {
           if (!activeRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; return; }
@@ -336,9 +376,6 @@ export default function MonitoringScreen({ navigation }) {
           if (at) setDeltaMin(Math.max(0, (at.getTime() - Date.now()) / 60_000));
         }, 1_000);
 
-        // ── 4. Deadline watchdog ──────────────────────────────────────────────
-        // Drives the in-app FORCE_WAKE experience while the app is foregrounded.
-        // The OS-level notification armed above is the safety net for when it's not.
         deadlineRef.current = setInterval(() => {
           if (!activeRef.current || alarmFiredRef.current) {
             clearInterval(deadlineRef.current); deadlineRef.current = null; return;
@@ -351,29 +388,25 @@ export default function MonitoringScreen({ navigation }) {
           }
         }, 1_000);
 
-        // ── 5. Register BLE window callback ───────────────────────────────────
         setMonitoringCallback(win => handleWindow(win));
+        console.log(`[Monitoring] Live monitoring loop active after ${Date.now() - attemptStartedAt}ms (notification arming continues in background)`);
       })(), STARTUP_TIMEOUT_MS, 'startMonitoring() body');
 
     } catch (err) {
-      console.error('[Monitoring] startMonitoring failed:', err.message ?? err);
+      console.error(`[Monitoring] startMonitoring failed after ${Date.now() - attemptStartedAt}ms:`, err.message ?? err);
     } finally {
-      // Only reset `starting` if no newer attempt has superseded this one,
-      // so a slow-to-time-out stale call can't clobber a fresher success.
       if (startAttemptRef.current === myAttempt) {
         setStarting(false);
       }
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
   async function stopMonitoring() {
     activeRef.current = false;
     setActive(false);
     _clearAllIntervals();
     setMonitoringCallback(null);
 
-    // User ended the session early — the deadline alarm is no longer wanted.
     if (scheduledAlarmIdRef.current) {
       await Notifications.cancelScheduledNotificationAsync(scheduledAlarmIdRef.current).catch(() => {});
       scheduledAlarmIdRef.current = null;
@@ -387,9 +420,6 @@ export default function MonitoringScreen({ navigation }) {
     console.log('[Monitoring] SESSION STOPPED');
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // BLE window handler — every 15 s (STEP_SIZE=960 @ 64 Hz)
-  // ─────────────────────────────────────────────────────────────────────────
   async function handleWindow(window) {
     if (!activeRef.current || alarmFiredRef.current) return;
 
@@ -400,7 +430,6 @@ export default function MonitoringScreen({ navigation }) {
       : null;
     const deltaMinNow = deltaMs != null ? deltaMs / 60_000 : null;
 
-    // ── ACC gate ─────────────────────────────────────────────────────────────
     const threshold = prefsRef.current?.acc_threshold ?? 0.12;
     const moving    = accGate(window, threshold);
 
@@ -409,23 +438,30 @@ export default function MonitoringScreen({ navigation }) {
       rawProbs = [0.90, 0.08, 0.02];
       console.log(`[Win #${windowIdx}] ACC gate → MOVING  rawProbs: W=0.90 L=0.08 D=0.02`);
     } else {
-      // ── ONNX inference ────────────────────────────────────────────────────
+      if (predictingRef.current) {
+        console.warn(`[Win #${windowIdx}] Skipped — previous predict() still in flight`);
+        return;
+      }
+      predictingRef.current = true;
+      const predictStartedAt = Date.now();
       try {
-        rawProbs = await predict(window);
+        rawProbs = await timed(predict(window), `predict(window #${windowIdx})`);
         console.log(
           `[Win #${windowIdx}] ONNX → ` +
           `W=${rawProbs[0].toFixed(3)} L=${rawProbs[1].toFixed(3)} D=${rawProbs[2].toFixed(3)} ` +
-          `stage=${STAGE_NAMES[argmax(rawProbs)]}  Δt=${deltaMinNow?.toFixed(1) ?? '—'}min`
+          `stage=${STAGE_NAMES[argmax(rawProbs)]}  Δt=${deltaMinNow?.toFixed(1) ?? '—'}min  ` +
+          `(predict took ${Date.now() - predictStartedAt}ms)`
         );
       } catch (e) {
-        console.error(`[Win #${windowIdx}] ONNX predict failed:`, e.message);
-        return;   // skip this window — do NOT fall back to heuristic
+        console.error(`[Win #${windowIdx}] ONNX predict failed after ${Date.now() - predictStartedAt}ms:`, e.message);
+        return;
+      } finally {
+        predictingRef.current = false;
       }
     }
 
     if (!activeRef.current || alarmFiredRef.current) return;
 
-    // ── alarmDecision ─────────────────────────────────────────────────────
     if (!prefsRef.current || !alarmTimeRef.current) return;
 
     const result = alarmDecision({
@@ -441,7 +477,6 @@ export default function MonitoringScreen({ navigation }) {
       `  EMA: W=${result.probs[0].toFixed(3)} L=${result.probs[1].toFixed(3)} D=${result.probs[2].toFixed(3)}`
     );
 
-    // ── Update UI ─────────────────────────────────────────────────────────
     setProbs(result.probs);
     setAction(result.action);
     setDeltaMin(result.deltaMin);
@@ -455,7 +490,6 @@ export default function MonitoringScreen({ navigation }) {
     predsRef.current.push(pred);
     setTimeline(t => [...t.slice(-60), pred]);
 
-    // ── Trigger alarm ─────────────────────────────────────────────────────
     if ((result.action === 'WAKE' || result.action === 'FORCE_WAKE') && !alarmFiredRef.current) {
       console.log(`[Win #${windowIdx}] 🔔 ALARM → ${result.action}`);
       alarmFiredRef.current = true;
@@ -463,7 +497,6 @@ export default function MonitoringScreen({ navigation }) {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
   async function triggerAlarm(action, finalProbs, minutesEarly) {
     _clearAllIntervals();
     setMonitoringCallback(null);
@@ -478,53 +511,66 @@ export default function MonitoringScreen({ navigation }) {
     }
     const savedSessionId = sessionRef.current?.id;
     sessionRef.current = null;
-
-    // Clear the scheduled deadline alarm (whether this IS that alarm firing,
-    // or a smart WAKE preempting it) plus any stragglers, and clear the
-    // notification shade, before firing the single "live" alarm notification.
-    // FIX: Wrapped in try/catch with generous timeout to prevent blocking the alarm UI.
-    try {
-      await withTimeout(Notifications.cancelAllScheduledNotificationsAsync(), 10_000, 'cancelAll(triggerAlarm)');
-    } catch (e) {
-      console.warn('[Monitoring] cancelAll slow/failed in triggerAlarm:', e.message);
-    }
-    
-    try {
-      await withTimeout(Notifications.dismissAllNotificationsAsync(), 10_000, 'dismissAll(triggerAlarm)');
-    } catch (e) {
-      console.warn('[Monitoring] dismissAll slow/failed in triggerAlarm:', e.message);
-    }
-    
     scheduledAlarmIdRef.current = null;
 
-    await _ensureAlarmChannel();
-    await Notifications.scheduleNotificationAsync({
-    content: {
-      title:    action === 'FORCE_WAKE' ? '⏰ Wake up!' : '🌅 Good time to wake up',
-      body:     `Stage: ${STAGE_NAMES[argmax(finalProbs)]}`,
-      sound:    ALARM_SOUND,
-      priority: Notifications.AndroidNotificationPriority.MAX,
-      sticky:   false,
-      ...(Platform.OS === 'android' ? { channelId: ALARM_CHANNEL_ID } : {}),
-    },
-    trigger: null,
-  });
+    // FIX (v4): navigation and the live alarm notification used to be
+    // gated behind two sequential, await'd 10s-timeout cleanup calls below
+    // — on a slow device that's 20+ seconds of dead time between the model
+    // deciding WAKE and the user seeing/hearing anything. _ensureAlarmChannel
+    // is fast (it's a local channel registration, observed ~11ms in logs)
+    // so it stays awaited, but it must come before the schedule call below
+    // or the sound/importance settings on Android may not apply.
+    await timed(_ensureAlarmChannel(), '_ensureAlarmChannel(triggerAlarm)');
 
-    // Optional post-alarm PVT, fires ~1 minute from now. Fire-and-forget —
-    // don't block navigation on it.
-    scheduleOptionalPVT().catch(e =>
-      console.warn('[Monitoring] scheduleOptionalPVT failed:', e)
-    );
+    // Post the actual alarm the user needs to see/hear NOW, then navigate
+    // immediately — neither is gated on cleanup of old notifications.
+    timed(
+      Notifications.scheduleNotificationAsync({
+        content: {
+          title:    action === 'FORCE_WAKE' ? '⏰ Wake up!' : '🌅 Good time to wake up',
+          body:     `Stage: ${STAGE_NAMES[argmax(finalProbs)]}`,
+          sound:    ALARM_SOUND,
+          priority: Notifications.AndroidNotificationPriority.MAX,
+          sticky:   false,
+          ...(Platform.OS === 'android' ? { channelId: ALARM_CHANNEL_ID } : {}),
+        },
+        trigger: null,
+      }),
+      'scheduleNotificationAsync(live alarm)'
+    ).catch(e => console.warn('[Monitoring] scheduleNotificationAsync(live alarm) failed:', e.message));
 
-    navigationRef.current.navigate('Alarm', {
+    // FIX: must use the shared root-level navigationRef (attached to
+    // NavigationContainer in AppNavigator.js, same one pvtScheduler.js
+    // uses), NOT this screen's own `navigation` prop. MonitoringScreen
+    // lives inside the bottom Tab.Navigator ('Sleep' tab) — its injected
+    // `navigation` prop is scoped to that tab navigator, which has no
+    // 'Alarm' route. Only the root Stack.Navigator (sibling of 'Main')
+    // has 'Alarm' / 'Feedback' / 'PVT'. Calling navigate('Alarm') on the
+    // tab-scoped prop was silently doing nothing — this is why the live
+    // alarm notification posted correctly but the Alarm screen never
+    // appeared.
+    rootNavigationRef.current?.navigate('Alarm', {
       action,
       probs:       finalProbs,
       sessionId:   savedSessionId,
       minutesEarly,
     });
+
+    // NOTE: scheduleOptionalPVT() removed — PVT now shows automatically
+    // right after the user rates their wake-up (FeedbackScreen.submit()
+    // navigates straight to 'PVT'), so the old 60s-delayed notification
+    // would only ever create a confusing duplicate prompt.
+
+    // Fire-and-forget cleanup of stale scheduled notifications (the
+    // background deadline alarm armed in startMonitoring(), plus any
+    // stragglers). This is tidiness only — clearing the shade — and must
+    // never block the alarm the user is already seeing/hearing above.
+    timed(Notifications.cancelAllScheduledNotificationsAsync(), 'cancelAll(triggerAlarm)(bg)')
+      .catch(e => console.warn('[Monitoring] cancelAll(triggerAlarm) failed:', e.message));
+    timed(Notifications.dismissAllNotificationsAsync(), 'dismissAll(triggerAlarm)(bg)')
+      .catch(e => console.warn('[Monitoring] dismissAll(triggerAlarm) failed:', e.message));
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
   const stageColor   = currentStage != null ? STAGE_COLORS[currentStage] : colors.textDim;
   const canStart     = bleOk && modelReady && !starting && !active;
   const startLabel   = starting         ? 'Starting…'
@@ -540,7 +586,6 @@ export default function MonitoringScreen({ navigation }) {
     >
       <Text style={styles.title}>Sleep Monitor</Text>
 
-      {/* ── Status orb ───────────────────────────────────────── */}
       <View style={styles.orbContainer}>
         <Animated.View style={[styles.orbOuter, { borderColor: stageColor + '30', transform: [{ scale: pulseAnim }] }]}>
           <View style={[styles.orbInner, { borderColor: stageColor + '60', backgroundColor: stageColor + '12' }]}>
@@ -557,7 +602,6 @@ export default function MonitoringScreen({ navigation }) {
         </Animated.View>
       </View>
 
-      {/* ── Alarm countdown ──────────────────────────────────── */}
       {active && deltaMin != null && (
         <View style={styles.alarmRow}>
           <Text style={styles.alarmLabel}>ALARM IN</Text>
@@ -572,7 +616,6 @@ export default function MonitoringScreen({ navigation }) {
         </View>
       )}
 
-      {/* ── Probability bars ─────────────────────────────────── */}
       {active && (
         <View style={styles.card}>
           <Text style={styles.cardLabel}>
@@ -584,7 +627,6 @@ export default function MonitoringScreen({ navigation }) {
         </View>
       )}
 
-      {/* ── Mini timeline ────────────────────────────────────── */}
       {timeline.length > 0 && (
         <View style={styles.card}>
           <Text style={styles.cardLabel}>TONIGHT</Text>
@@ -604,7 +646,6 @@ export default function MonitoringScreen({ navigation }) {
         </View>
       )}
 
-      {/* ── BLE + model status ───────────────────────────────── */}
       <View style={styles.statusRow}>
         <View style={styles.statusChip}>
           <View style={[styles.statusDot, { backgroundColor: bleOk ? colors.success : colors.danger }]} />
@@ -616,7 +657,6 @@ export default function MonitoringScreen({ navigation }) {
         </View>
       </View>
 
-      {/* ── Start / Stop ─────────────────────────────────────── */}
       <TouchableOpacity
         style={[
           styles.mainBtn,
@@ -633,8 +673,6 @@ export default function MonitoringScreen({ navigation }) {
     </ScrollView>
   );
 }
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
 
 function ProbBar({ label, value, color }) {
   return (

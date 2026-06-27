@@ -19,6 +19,37 @@
  *                    weight_type=QuantType.QInt8,
  *                    op_types_to_quantize=['Conv','Gemm','MatMul','LSTM'])
  * and swap the ONNX_ASSET require() below to the int8 file.
+ *
+ * ── SANDBOX-PROCESS-DEATH RECOVERY (added) ────────────────────────────────
+ * Confirmed via logcat on a ColorOS/Realme device: Android's low-memory
+ * killer can reap the WebView's sandboxed Chromium renderer process
+ * mid-session ("Killing ...:sandboxed_process0:...SandboxedProcessService0
+ * (adj 905): remove task"), independent of anything this app does. ColorOS
+ * is markedly more aggressive about this than stock Android.
+ *
+ * Previously, onContentProcessDidTerminate() only rejected the *load*
+ * promise machinery (mdReject/mdResolve) — it left mdLoaded.current === true
+ * and did nothing about any predict() call that was awaiting a response
+ * from the now-dead renderer. That predict() call's promise sat in the
+ * `pending` Map forever with no way to resolve or reject, since the
+ * renderer that would have sent PREDICT_RESULT/PREDICT_ERROR no longer
+ * exists. The result: handleWindow() in MonitoringScreen hung on
+ * `await predict(window)` indefinitely — the whole monitoring session
+ * appeared frozen even though the rest of the JS thread kept running fine.
+ *
+ * Fix: onContentProcessDidTerminate() (and the WebView onError handler)
+ * now additionally:
+ *   1. Rejects every entry currently in the `pending` predict Map with a
+ *      clear "WebView process died" error, so any in-flight predict()
+ *      caller gets a real rejection instead of hanging forever.
+ *   2. Resets mdLoaded.current = false and clears mdLoadPromise.current,
+ *      so the *next* predict() call detects the model isn't loaded and
+ *      transparently re-runs loadModel() against the freshly restarted
+ *      WebView/session, rather than silently talking to a session that no
+ *      longer exists.
+ * classifier.js's predict() already calls loadModel() first if
+ * !isModelLoaded(), so no changes were needed there — this recovers
+ * automatically on the next BLE window.
  */
 
 import React, { useRef, forwardRef, useImperativeHandle, useEffect } from 'react';
@@ -347,6 +378,45 @@ const OnnxWebViewBridge = forwardRef((_props, ref) => {
     wvWaiters.current = [];
   }
 
+  /**
+   * FIX: Called when the WebView's renderer process dies — either crashed
+   * or, as confirmed via logcat, reaped by the OS low-memory killer
+   * ("Killing ...:sandboxed_process0:... (adj 905): remove task" — observed
+   * on ColorOS/Realme mid-session). This is the critical recovery path that
+   * was previously missing:
+   *
+   *   1. wvReady is reset — the WebView's JS context is gone, so the next
+   *      loadModel() must wait for a fresh WEBVIEW_READY rather than
+   *      assuming the old one is still valid.
+   *   2. Every in-flight predict() promise in `pending` is rejected with a
+   *      clear, identifiable error. Without this, those promises hang
+   *      forever — no PREDICT_RESULT/PREDICT_ERROR can ever arrive from a
+   *      renderer that no longer exists, which is what froze the session:
+   *      handleWindow()'s `await predict(window)` simply never returned.
+   *   3. mdLoaded/mdLoadPromise are reset so the *next* predict() call
+   *      transparently re-triggers loadModel() against the new WebView
+   *      instance, instead of believing a dead session is still usable.
+   *
+   * react-native-webview remounts the underlying native WebView after a
+   * process-terminate event, which is what fires WEBVIEW_READY again and
+   * lets the chunked model reload proceed normally on the next call.
+   */
+  function _handleProcessDeath(reason) {
+    console.error('[OnnxBridge] WebView process died:', reason);
+
+    wvReady.current = false;
+
+    for (const [id, p] of pending.entries()) {
+      pending.delete(id);
+      p.reject(new Error('WebView process died: ' + reason));
+    }
+
+    mdLoaded.current      = false;
+    mdLoadPromise.current = null;
+    mdResolve.current     = null;
+    mdReject.current      = null;
+  }
+
   return (
     <View style={{ width: 0, height: 0, overflow: 'hidden' }}>
       <WebView
@@ -359,8 +429,8 @@ const OnnxWebViewBridge = forwardRef((_props, ref) => {
         allowFileAccessFromFileURLs
         allowUniversalAccessFromFileURLs
         style={{ width: 1, height: 1 }}
-        onError={() => _rejectLoad('WebView error')}
-        onContentProcessDidTerminate={() => _rejectLoad('WebView terminated')}
+        onError={() => _handleProcessDeath('WebView error')}
+        onContentProcessDidTerminate={() => _handleProcessDeath('Content process terminated (likely OS low-memory kill)')}
       />
     </View>
   );
